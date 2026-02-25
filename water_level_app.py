@@ -735,12 +735,6 @@ if st.button("▶ Process All Files", type="primary"):
                 continue
             processed = calc_water_level_hobo(raw, sh, baro_df, default_atm_kpa)
 
-        # Drop physically impossible negative water-level readings
-        n_neg = (processed["Water_level_m"] < 0).sum()
-        processed = processed[processed["Water_level_m"] >= 0].copy()
-        if n_neg:
-            st.info(f"ℹ️ **{fname}**: {n_neg:,} negative water-level value(s) removed.")
-
         processed["Offload_file"] = fname
         processed["Station"]      = station
         processed["Sensor_SN"]    = sn
