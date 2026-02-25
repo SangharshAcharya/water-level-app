@@ -517,7 +517,7 @@ Mixed uploads are fine — formats are detected automatically.
 
     st.divider()
     st.link_button(
-        "🌐 Visit US",
+        "🌐 More about us",
         "https://s4w-nepal.smartphones4water.org/",
         use_container_width=True,
     )
