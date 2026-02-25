@@ -1109,14 +1109,14 @@ st.caption(
 
 comp_mode = st.radio(
     "Comparison mode",
-    ["\ud83d\udccd Multiple stations — same period", "\ud83d\udcc5 Same station — different periods"],
+    ["📍 Multiple stations — same period", "📅 Same station — different periods"],
     horizontal=True,
     label_visibility="collapsed",
     key="comp_mode_radio",
 )
 
 # ── Mode A: multiple stations, same period ────────────────────────────────────────────
-if comp_mode == "\ud83d\udccd Multiple stations — same period":
+if comp_mode == "📍 Multiple stations — same period":
     cmp_c1, cmp_c2, cmp_c3 = st.columns([3, 1, 1])
     cmp_stations = cmp_c1.multiselect(
         "Stations to compare",
