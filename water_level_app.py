@@ -33,7 +33,7 @@ GRAVITY_OBS     = 9.80665e3  # for OBS mbar formula
 
 OBS_SENSOR_HEIGHT_DEFAULTS = {
     "303": 0.08, "469": 0.10, "470": 0.10,
-    "300": 0.10, "301": 0.10, "304": 0.10, "455": 0.10, "467": 0.10,
+    "300": 0.10, "301": 0.10, "304": 0.10, "455": 0.19, "467": 0.10,
 }
 # Hobo sensors sit on the river bed — height offset is always 0.0 m.
 HOBO_SENSOR_HEIGHT_DEFAULT = 0.0
