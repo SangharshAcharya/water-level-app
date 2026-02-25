@@ -476,7 +476,7 @@ Mixed uploads are fine — formats are detected automatically.
 
     st.divider()
     st.link_button(
-        "🌐 Visit S4W-Nepal",
+        "🌐 Visit US",
         "https://s4w-nepal.smartphones4water.org/",
         use_container_width=True,
     )
@@ -734,6 +734,12 @@ if st.button("▶ Process All Files", type="primary"):
                 st.error(f"**{fname}**: {err}")
                 continue
             processed = calc_water_level_hobo(raw, sh, baro_df, default_atm_kpa)
+
+        # Drop physically impossible negative water-level readings
+        n_neg = (processed["Water_level_m"] < 0).sum()
+        processed = processed[processed["Water_level_m"] >= 0].copy()
+        if n_neg:
+            st.info(f"ℹ️ **{fname}**: {n_neg:,} negative water-level value(s) removed.")
 
         processed["Offload_file"] = fname
         processed["Station"]      = station
