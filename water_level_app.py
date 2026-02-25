@@ -1,18 +1,19 @@
 """
-Water Level Analysis Web App  (S4W-Nepal)
-==========================================
-Single-upload interface that auto-detects file type and applies the correct
-pressure → water-level formula.
+Water Level Analysis — S4W-Nepal
+=================================
+Upload raw sensor files (.txt or .csv) — the app auto-detects the format,
+applies the correct pressure → water-level formula, and delivers interactive
+charts, per-station results, and downloadable CSV / Excel files.
 
-File types handled
-------------------
-• OBS  (.txt)            OpenOBS logger, Unix-timestamp CSV
-• Hobo (.csv)            HOBOware-exported CSV (Abs Pres, kPa)
+Formats supported
+-----------------
+• OpenOBS (.txt)   — Unix-timestamp CSV, two firmware variants auto-detected
+• Hobo U20L (.csv) — HOBOware-exported absolute pressure CSV
 
-Atmospheric pressure source
----------------------------
+Atmospheric pressure
+--------------------
 • Default Kathmandu Valley value (~86 kPa)
-• Upload METER ATMOS 41 Atmospheric_pressure.csv
+• Upload METER ATMOS 41 Atmospheric_pressure.csv for time-matched correction
 """
 
 import io
@@ -460,14 +461,16 @@ with st.sidebar:
     st.divider()
     st.markdown(
         """
-**Auto-detected formats**
+**Accepted file types**
 
-| Extension | Detected as |
-|-----------|-------------|
-| `.txt` | OBS logger |
-| `.csv` (HOBOware) | Hobo CSV |
+| File | Sensor |
+|------|--------|
+| `.txt` | OpenOBS logger |
+| `.csv` | Hobo U20L (HOBOware export) |
 
-> For Hobo U20L loggers: connect to HOBOware, read out the device, then **Export → Text/CSV** and upload the `.csv` here.
+Mixed uploads are fine — formats are detected automatically.
+
+> **Hobo users:** connect the logger via the optical USB coupler, open HOBOware → *Device → Readout*, then **Export → Text/CSV** and upload the `.csv` here.
         """
     )
 
@@ -510,10 +513,11 @@ openpyxl
 # File uploader
 # ─────────────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
-    "Upload sensor files  ·  OBS `.txt`  ·  Hobo HOBOware `.csv`",
+    "Upload raw sensor files",
     type=["txt", "csv"],
     accept_multiple_files=True,
-    help="Mix of OBS and Hobo files is supported. Each file is auto-detected and processed independently.",
+    help="Drag and drop one or more `.txt` (OpenOBS) or `.csv` (HOBOware Hobo) files. "
+         "Format is detected automatically — you can mix file types freely.",
 )
 
 if not uploaded:
@@ -567,7 +571,7 @@ for _n in [u.name for u in uploaded]:
         _row["OBS Firmware"] = _fw_tag
     det_rows.append(_row)
 det_df = pd.DataFrame(det_rows)
-with st.expander("🔍 Auto-detected file formats", expanded=True):
+with st.expander("� Uploaded files", expanded=False):
     st.table(det_df)
     if any(file_obs_firmware.get(_n, ("new",))[0] == "old" for _n in obs_names):
         st.warning(
@@ -585,15 +589,15 @@ if unk_names:
 # ─────────────────────────────────────────────────────────────────────────────
 parseable = obs_names + hobo_names
 if not parseable:
-    st.info("No parseable files yet. Upload OBS `.txt` or HOBOware CSV files.")
+    st.info("No recognisable sensor files found. Upload `.txt` (OpenOBS) or `.csv` (HOBOware Hobo) files.")
     st.stop()
 
 st.markdown("---")
 st.subheader("📍 Station Name Assignment")
 st.caption(
-    "The app detected the sensor serial numbers below. "
-    "Assign a station / location name to each SN — the plots and downloads will be grouped by station name. "
-    "Multiple offload files from the same sensor automatically share the same station."
+    "Serial numbers detected from the uploaded files are listed below. "
+    "Give each one a meaningful station name — plots and downloads will be grouped by this name. "
+    "Multiple offload files from the same sensor are automatically merged under one station."
 )
 
 unique_sns = sorted(set(file_sn.values()))
@@ -626,9 +630,9 @@ sn_station_map = st.session_state["sn_station_map"]
 st.markdown("---")
 st.subheader("📏 Sensor Settings")
 st.caption(
-    "Set the sensor height (distance from sensor face to channel bed, metres) for each file. "
-    "Use **Set ALL heights to** for a quick batch update when no repositioning occurred between offloads. "
-    "The OBS Firmware column is auto-detected — override it here if you know it is wrong."
+    "Set the sensor height (distance from sensor face to channel bed, in metres). "
+    "For OpenOBS sensors, use **Set OBS heights to** to batch-update all at once. "
+    "The Firmware column is auto-detected from the raw pressure value — override it here if needed."
 )
 
 # ── Build default lists ────────────────────────────────────────────────────────
@@ -1036,6 +1040,181 @@ if not raw_hobo.empty:
     download_pair("Hobo Raw", raw_hobo, "Hobo_raw_all", "hobo_raw_combined")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Comparison Explorer
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("🔀 Comparison Explorer")
+st.caption(
+    "Compare water levels or other parameters across stations over the same period, "
+    "or compare different time periods at the same station."
+)
+
+comp_mode = st.radio(
+    "Comparison mode",
+    ["\ud83d\udccd Multiple stations — same period", "\ud83d\udcc5 Same station — different periods"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="comp_mode_radio",
+)
+
+# ── Mode A: multiple stations, same period ────────────────────────────────────────────
+if comp_mode == "\ud83d\udccd Multiple stations — same period":
+    cmp_c1, cmp_c2, cmp_c3 = st.columns([3, 1, 1])
+    cmp_stations = cmp_c1.multiselect(
+        "Stations to compare",
+        options=station_list,
+        default=station_list[:min(len(station_list), 4)],
+        key="cmp_a_stations",
+    )
+    cmp_start = cmp_c2.date_input(
+        "From",
+        value=all_proc["Date"].min().date(),
+        min_value=all_proc["Date"].min().date(),
+        max_value=all_proc["Date"].max().date(),
+        key="cmp_a_start",
+    )
+    cmp_end = cmp_c3.date_input(
+        "To",
+        value=all_proc["Date"].max().date(),
+        min_value=all_proc["Date"].min().date(),
+        max_value=all_proc["Date"].max().date(),
+        key="cmp_a_end",
+    )
+
+    param_options: dict[str, str] = {"Water Level (m)": "Water_level_m"}
+    if "Temp_C" in all_proc.columns:
+        param_options["Water Temperature (°C)"] = "Temp_C"
+    if "Water_temp" in all_proc.columns:
+        param_options["Water Temp — raw (OBS)"] = "Water_temp"
+    if "Abs_Pres_kPa" in all_proc.columns:
+        param_options["Absolute Pressure (kPa)"] = "Abs_Pres_kPa"
+
+    cmp_param_label = st.selectbox("Parameter", list(param_options.keys()), key="cmp_a_param")
+    cmp_param       = param_options[cmp_param_label]
+
+    if not cmp_stations:
+        st.info("Select at least one station above.")
+    else:
+        cmp_mask = (
+            (all_proc["Date"].dt.date >= cmp_start) &
+            (all_proc["Date"].dt.date <= cmp_end) &
+            (all_proc["Station"].isin(cmp_stations))
+        )
+        cmp_data = all_proc[cmp_mask]
+        if cmp_data.empty or cmp_param not in cmp_data.columns:
+            st.warning("No data available for the selected stations and period.")
+        else:
+            fig_cmp = go.Figure()
+            for i, stn in enumerate(cmp_stations):
+                seg = cmp_data[cmp_data["Station"] == stn]
+                if seg.empty:
+                    continue
+                fig_cmp.add_trace(go.Scatter(
+                    x=seg["Date"], y=seg[cmp_param],
+                    mode="lines", name=stn,
+                    line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
+                    hovertemplate=f"<b>%{{x|%Y-%m-%d %H:%M}}</b><br>{stn}: %{{y:.4f}}<extra></extra>",
+                ))
+            fig_cmp.update_layout(
+                xaxis_title="Date / Time", yaxis_title=cmp_param_label,
+                height=420, hovermode="x unified", template="plotly_white",
+                margin=dict(t=30, b=40),
+            )
+            st.plotly_chart(fig_cmp, use_container_width=True)
+            out_cols = [c for c in ["Date", "Station", "Sensor_SN", cmp_param] if c in cmp_data.columns]
+            download_pair(
+                f"Comparison — {cmp_param_label}",
+                cmp_data[out_cols],
+                f"comparison_stations_{cmp_start}_{cmp_end}",
+                "cmp_a_dl",
+            )
+
+# ── Mode B: same station, different periods ────────────────────────────────────────────
+else:
+    bp_c1, bp_c2 = st.columns([3, 1])
+    cmp_station = bp_c1.selectbox("Station", options=station_list, key="cmp_b_station")
+    n_periods   = int(bp_c2.select_slider("Periods", options=[2, 3, 4], value=2, key="cmp_b_nperiods"))
+
+    align_mode = st.radio(
+        "Time axis",
+        ["Actual dates (calendar overlay)", "Relative (hours from each period start)"],
+        horizontal=True,
+        key="cmp_b_align",
+    )
+
+    st_data_all = all_proc[all_proc["Station"] == cmp_station]
+    date_min_s  = st_data_all["Date"].min()
+    date_max_s  = st_data_all["Date"].max()
+    chunk_days  = max(1, int((date_max_s - date_min_s).days / n_periods))
+
+    period_cols = st.columns(n_periods)
+    periods: list[tuple] = []
+    for i, col in enumerate(period_cols):
+        default_ps = (date_min_s + pd.Timedelta(days=i * chunk_days)).date()
+        default_pe = min(
+            date_max_s.date(),
+            (date_min_s + pd.Timedelta(days=(i + 1) * chunk_days - 1)).date(),
+        )
+        with col:
+            ps = st.date_input(
+                f"Period {i + 1} — start",
+                value=default_ps,
+                min_value=date_min_s.date(), max_value=date_max_s.date(),
+                key=f"cmp_b_ps_{i}",
+            )
+            pe = st.date_input(
+                f"Period {i + 1} — end",
+                value=default_pe,
+                min_value=date_min_s.date(), max_value=date_max_s.date(),
+                key=f"cmp_b_pe_{i}",
+            )
+            periods.append((ps, pe))
+
+    x_title  = "Hours from period start" if "Relative" in align_mode else "Date / Time"
+    fig_cmp2 = go.Figure()
+    cmp_b_frames: list[pd.DataFrame] = []
+    has_cmp_data = False
+    for i, (ps, pe) in enumerate(periods):
+        seg = st_data_all[
+            (st_data_all["Date"].dt.date >= ps) &
+            (st_data_all["Date"].dt.date <= pe)
+        ].copy()
+        if seg.empty:
+            continue
+        has_cmp_data = True
+        plabel = f"{ps} → {pe}"
+        if "Relative" in align_mode:
+            seg["_x"] = (seg["Date"] - seg["Date"].min()).dt.total_seconds() / 3600
+        else:
+            seg["_x"] = seg["Date"]
+        seg["Period"] = plabel
+        fig_cmp2.add_trace(go.Scatter(
+            x=seg["_x"], y=seg["Water_level_m"],
+            mode="lines", name=plabel,
+            line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
+            hovertemplate=f"{plabel}<br>%{{x}}<br>WL: %{{y:.4f}} m<extra></extra>",
+        ))
+        cmp_b_frames.append(seg[["Date", "Period", "Water_level_m"]].copy())
+
+    if has_cmp_data:
+        fig_cmp2.update_layout(
+            title=f"Water Level — {cmp_station}",
+            xaxis_title=x_title, yaxis_title="Water Level (m)",
+            height=420, hovermode="x unified", template="plotly_white",
+            margin=dict(t=50, b=40),
+        )
+        st.plotly_chart(fig_cmp2, use_container_width=True)
+        if cmp_b_frames:
+            download_pair(
+                f"Comparison — {cmp_station}",
+                pd.concat(cmp_b_frames, ignore_index=True),
+                f"comparison_{cmp_station.replace(' ', '_')}_periods",
+                "cmp_b_dl",
+            )
+    else:
+        st.warning("No data in any of the selected periods for this station.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # About
 # ─────────────────────────────────────────────────────────────────────────────
 with st.expander("ℹ️ About — Formulas & Data Sources", expanded=False):
@@ -1056,8 +1235,8 @@ Both variants then:
 
 $$H\,(\text{m}) = \frac{P_{hydro}}{1000 \times 9806.65} \times 10^5 + h_{sensor}$$
 
-Auto-detection uses **median raw pressure > 50 000 AND firmware date before 15 Jul 2025**.
-Override the detected firmware version in the *Sensor Settings* table if needed.
+Auto-detection uses the **first raw pressure reading**: values above 50\u202f000 → old firmware (÷100); at or below → new firmware (÷10).
+Override the detected firmware in the *Sensor Settings* table if needed.
 
 ---
 
