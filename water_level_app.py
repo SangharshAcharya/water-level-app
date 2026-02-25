@@ -303,6 +303,47 @@ def calc_water_level_hobo(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OBS edge-row trimmer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def trim_obs_edges(
+    df: pd.DataFrame, n: int = 2
+) -> tuple[pd.DataFrame, list[int]]:
+    """
+    Inspect the first and last `n` rows of an OBS DataFrame.
+    A row is dropped if its Pressure OR Ambient_light value is a statistical
+    outlier relative to the bulk of the series:
+        |value - median| > 3 * IQR   (where IQR is from the middle 90 % of data)
+    Returns (trimmed_df, list_of_dropped_indices).
+    Skips trimming when fewer than (2*n + 4) rows are present.
+    """
+    dropped: list[int] = []
+    if len(df) < 2 * n + 4:
+        return df, dropped
+
+    inner = df.iloc[n:-n]   # bulk of series, used to compute reference stats
+
+    def is_outlier(series: pd.Series, value: float) -> bool:
+        q25, q75 = series.quantile([0.25, 0.75])
+        iqr = q75 - q25
+        if iqr == 0:
+            return False
+        return abs(value - series.median()) > 3 * iqr
+
+    edge_indices = list(df.index[:n]) + list(df.index[-n:])
+    for idx in edge_indices:
+        row = df.loc[idx]
+        for col in ["Pressure", "Ambient_light"]:
+            if col in df.columns:
+                val = row.get(col)
+                if pd.notna(val) and is_outlier(inner[col].dropna(), val):
+                    dropped.append(idx)
+                    break   # already marking this row — no need to check other cols
+
+    return df.drop(index=dropped).reset_index(drop=True), dropped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Atmospheric pressure loader
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -724,6 +765,12 @@ if st.button("▶ Process All Files", type="primary"):
             if err:
                 st.error(f"**{fname}**: {err}")
                 continue
+            raw, dropped_idx = trim_obs_edges(raw)
+            if dropped_idx:
+                st.info(
+                    f"\u2702\ufe0f **{fname}**: {len(dropped_idx)} edge row(s) removed "
+                    f"(outlier Pressure / Ambient\_light at start or end of deployment)."
+                )
             fw_val = file_fw_overrides.get(fname, "new")
             if fw_val not in ("old", "new"):
                 fw_val = file_obs_firmware.get(fname, ("new",))[0]
