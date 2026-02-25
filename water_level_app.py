@@ -7,8 +7,7 @@ pressure → water-level formula.
 File types handled
 ------------------
 • OBS  (.txt)            OpenOBS logger, Unix-timestamp CSV
-• Hobo (.csv / .txt→)   HOBOware-exported CSV (Abs Pres, kPa)
-• Hobo (.hobo)           Onset binary – metadata extracted, data export instructions shown
+• Hobo (.csv)            HOBOware-exported CSV (Abs Pres, kPa)
 
 Atmospheric pressure source
 ---------------------------
@@ -54,18 +53,14 @@ OBS_FW_PRESSURE_THRESHOLD = 50_000
 
 def detect_format(file_bytes: bytes, filename: str) -> str:
     """
-    Returns one of: 'obs_txt' | 'hobo_csv' | 'hobo_binary' | 'unknown'
+    Returns one of: 'obs_txt' | 'hobo_csv' | 'unknown'
 
     Priority:
-      1. HOBO binary magic bytes → 'hobo_binary'
-      2. Contains 'time,' + 'ambient_light' header → 'obs_txt'
-      3. Contains 'Date Time' + 'Abs Pres' → 'hobo_csv'
-      4. .txt with 'time,' header (minimal OBS firmware) → 'obs_txt'
-      5. Fallback → 'unknown'
+      1. Contains 'time,' + 'ambient_light' header → 'obs_txt'
+      2. Contains 'Date Time' + 'Abs Pres' → 'hobo_csv'
+      3. .txt with 'time,' header (minimal OBS firmware) → 'obs_txt'
+      4. Fallback → 'unknown'
     """
-    if file_bytes[:4] == b"HOBO":
-        return "hobo_binary"
-
     try:
         text = file_bytes[:3000].decode("utf-8", errors="replace")
     except Exception:
@@ -307,38 +302,6 @@ def calc_water_level_hobo(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hobo binary metadata extractor
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_hobo_binary_metadata(file_bytes: bytes) -> dict:
-    """
-    Parse readable strings from Onset binary .hobo to extract device metadata.
-    Returns a dict suitable for display as a table.
-    """
-    strings  = re.findall(rb"[\x20-\x7e]{4,}", file_bytes)
-    readable = [s.decode("ascii", errors="replace").strip() for s in strings]
-
-    meta: dict = {"File size (bytes)": len(file_bytes)}
-    for s in readable:
-        if "HOBO" in s and "Water Level" in s:
-            meta["Device"] = s
-        elif "Onset" in s and "Device" not in meta:
-            meta["Manufacturer"] = s
-        elif re.match(r"^\d{7,10}$", s):
-            meta.setdefault("Serial number", s)
-        elif "HOBOware" in s:
-            meta["Software"] = s
-        elif "Time" in s and len(s) < 30:
-            meta["Timezone"] = s
-        elif s and not any(kw in s for kw in [
-            "HOBOware", "HOBO", "Onset", "Time", "\\", "Corporation"
-        ]) and len(s) > 3:
-            meta.setdefault("Deployment note", s)
-
-    return meta
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Atmospheric pressure loader
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -503,10 +466,8 @@ with st.sidebar:
 |-----------|-------------|
 | `.txt` | OBS logger |
 | `.csv` (HOBOware) | Hobo CSV |
-| `.hobo` | Onset binary ⚠️ |
 
-> Binary `.hobo` files are identified automatically. Metadata is extracted and shown.
-> To get the full data, export the file to CSV from **HOBOware** and re-upload.
+> For Hobo U20L loggers: connect to HOBOware, read out the device, then **Export → Text/CSV** and upload the `.csv` here.
         """
     )
 
@@ -532,7 +493,7 @@ Find your IP with `ipconfig` → look for *IPv4 Address*.
 1. Push `water_level_app.py` to a **GitHub** repository  
 2. Go to [share.streamlit.io](https://share.streamlit.io) → *New app*  
 3. Connect the repo — Streamlit Community Cloud hosts it **free**  
-4. Share the generated `*.streamlit.app` URL with anyone
+4. Share **https://water-level-s4w-nepal.streamlit.app** with anyone
 
 Add a `requirements.txt` next to the app file:
 ```
@@ -549,8 +510,8 @@ openpyxl
 # File uploader
 # ─────────────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
-    "Upload sensor files  ·  OBS `.txt`  ·  Hobo HOBOware `.csv`  ·  raw Hobo `.hobo`",
-    type=["txt", "csv", "hobo"],
+    "Upload sensor files  ·  OBS `.txt`  ·  Hobo HOBOware `.csv`",
+    type=["txt", "csv"],
     accept_multiple_files=True,
     help="Mix of OBS and Hobo files is supported. Each file is auto-detected and processed independently.",
 )
@@ -572,7 +533,6 @@ for uf in uploaded:
 
 obs_names  = [n for n, fmt in file_format.items() if fmt == "obs_txt"]
 hobo_names = [n for n, fmt in file_format.items() if fmt == "hobo_csv"]
-bin_names  = [n for n, fmt in file_format.items() if fmt == "hobo_binary"]
 unk_names  = [n for n, fmt in file_format.items() if fmt == "unknown"]
 
 # Detect OBS firmware version and serial number for each OBS file
@@ -587,10 +547,9 @@ for _n in hobo_names:
 
 # Detection summary
 fmt_labels = {
-    "obs_txt":     "✅ OBS logger (.txt)",
-    "hobo_csv":    "✅ Hobo HOBOware CSV",
-    "hobo_binary": "⚠️ Hobo binary — export to CSV first",
-    "unknown":     "❌ Unknown — will be skipped",
+    "obs_txt":  "✅ OBS logger (.txt)",
+    "hobo_csv": "✅ Hobo HOBOware CSV",
+    "unknown":  "❌ Unknown — will be skipped",
 }
 det_rows: list[dict] = []
 for _n in [u.name for u in uploaded]:
@@ -613,45 +572,13 @@ with st.expander("🔍 Auto-detected file formats", expanded=True):
     if any(file_obs_firmware.get(_n, ("new",))[0] == "old" for _n in obs_names):
         st.warning(
             "⚠️ One or more OBS files detected as **old firmware** "
-            "(median pressure > 50 000, firmware date before 15 Jul 2025). "
-            "Pressure divisor set to **100** (Pa units). "
+            "(first pressure reading > 50 000). "
+            "Pressure divisor set to **100** (~85 000 Pa units → mbar). "
             "You can override the firmware version per-file in the Sensor Settings table below."
         )
 
 if unk_names:
     st.warning("Skipping unrecognised files: " + ", ".join(f"`{f}`" for f in unk_names))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Binary .hobo — metadata panel (always shown immediately)
-# ─────────────────────────────────────────────────────────────────────────────
-if bin_names:
-    st.markdown("---")
-    st.subheader("⚠️ Binary Hobo Files")
-    st.error(
-        "**Binary `.hobo` files cannot be decoded directly** — Onset's format is proprietary "
-        "and requires the HOBOware SDK.\n\n"
-        "**To get your data into this app:**\n"
-        "1. Connect the Hobo U20L logger to your PC via the optical USB coupler\n"
-        "2. Open **HOBOware** → *Device* → *Readout device*\n"
-        "3. Click **Export** → **Text/CSV** → save the `.csv` file\n"
-        "4. Re-upload the exported `.csv` here — it will be processed automatically\n\n"
-        "Metadata extracted from the binary file(s) is shown below.",
-        icon="⚠️",
-    )
-    for fname in bin_names:
-        meta = extract_hobo_binary_metadata(file_cache[fname])
-        with st.expander(f"📋 Metadata — {fname}", expanded=True):
-            meta_rows = pd.DataFrame(
-                [{"Property": k, "Value": str(v)} for k, v in meta.items()]
-            )
-            st.table(meta_rows)
-            st.download_button(
-                "⬇ Download metadata as CSV",
-                data=to_csv_bytes(meta_rows),
-                file_name=fname.replace(".hobo", "_metadata.csv"),
-                mime="text/csv",
-                key=f"meta_{fname}",
-            )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Station name mapping
@@ -1142,13 +1069,6 @@ $$P_{hydro}\,(\text{kPa}) = P_{abs} - P_{atm}$$
 $$H\,(\text{m}) = \frac{P_{hydro}}{9.80665} + h_{sensor}$$
 
 ($\rho_{water} = 1000\,\text{kg/m}^3$, $g = 9.80665\,\text{m/s}^2$)
-
----
-
-### Why can't binary `.hobo` files be read directly?
-Onset's `.hobo` binary format uses a proprietary encoding (OpenDAL) that is
-not publicly documented. The HOBOware desktop software contains the decoder.
-Export via **HOBOware → Export → Text/CSV** to obtain a standard CSV.
 
 ---
 
