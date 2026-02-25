@@ -458,7 +458,7 @@ st.set_page_config(
     page_icon="💧",
     layout="wide",
 )
-st.title("💧 Water Level Analysis — S4W-Nepal")
+st.title("💧 Water Level Conversion — S4W-Nepal")
 st.caption(
     "Upload **OBS** (`.txt`) and/or **Hobo** (HOBOware-exported `.csv`, or raw `.hobo`) files. "
     "File types are detected automatically and the correct formula is applied to each."
