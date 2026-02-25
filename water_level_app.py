@@ -644,7 +644,9 @@ st.markdown("---")
 st.subheader("📏 Sensor Settings")
 st.caption(
     "Set the sensor height (distance from sensor face to channel bed, in metres). "
-    "For OpenOBS sensors, use **Set OBS heights to** to batch-update all at once. "
+    "Use **Set OBS sensor heights to** to batch-update all OBS files at once, "
+    "**Set height by Serial Number** to update all files of a specific sensor at once, "
+    "or edit individual rows in the table below. "
     "The Firmware column is auto-detected from the raw pressure value — override it here if needed."
 )
 
@@ -695,6 +697,43 @@ with bc2:
                 updated[fn] = batch_h
         st.session_state["sensor_heights"] = updated
         st.rerun()
+
+# ── Per-SN height setter ───────────────────────────────────────────────────────
+obs_files = [fn for fn in parseable if file_format[fn] == "obs_txt"]
+obs_sns = list(dict.fromkeys(file_sn.get(fn, "—") for fn in obs_files))  # unique, ordered
+if obs_sns:
+    with st.expander("🔢 Set height by Serial Number (SN)", expanded=False):
+        st.caption(
+            "Set sensor height for all files sharing the same SN at once. "
+            "Each SN corresponds to one physical sensor."
+        )
+        for sn_val in obs_sns:
+            sn_files = [fn for fn in obs_files if file_sn.get(fn, "—") == sn_val]
+            sn_label = sn_station_map.get(sn_val, sn_val)
+            cur_h = current_heights.get(sn_files[0], 0.10) if sn_files else 0.10
+            sc1, sc2, sc3 = st.columns([1, 1, 2])
+            with sc1:
+                sn_h = st.number_input(
+                    f"**SN {sn_val}** ({sn_label})  —  {len(sn_files)} file(s)",
+                    min_value=0.0, max_value=5.0,
+                    value=float(cur_h), step=0.005, format="%.3f",
+                    key=f"sn_height_input_{sn_val}",
+                )
+            with sc2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button(f"✅ Apply to SN {sn_val}", key=f"apply_sn_{sn_val}"):
+                    updated = dict(st.session_state["sensor_heights"])
+                    for fn in sn_files:
+                        updated[fn] = sn_h
+                    st.session_state["sensor_heights"] = updated
+                    st.rerun()
+            with sc3:
+                st.markdown(
+                    "<br><small style='color:grey'>" +
+                    ", ".join(fn for fn in sn_files) +
+                    "</small>",
+                    unsafe_allow_html=True,
+                )
 
 # ── Editable settings table ────────────────────────────────────────────────────
 height_df = pd.DataFrame({
