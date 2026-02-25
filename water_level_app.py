@@ -35,9 +35,8 @@ OBS_SENSOR_HEIGHT_DEFAULTS = {
     "303": 0.08, "469": 0.10, "470": 0.10,
     "300": 0.10, "301": 0.10, "304": 0.10, "455": 0.10, "467": 0.10,
 }
-HOBO_SENSOR_HEIGHT_DEFAULTS = {
-    "Gonsal": 0.10, "Maheshwari": 0.10, "RadheRadhe": 0.10,
-}
+# Hobo sensors sit on the river bed — height offset is always 0.0 m.
+HOBO_SENSOR_HEIGHT_DEFAULT = 0.0
 
 PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -718,8 +717,8 @@ for fn in parseable:
         sid = next((k for k in OBS_SENSOR_HEIGHT_DEFAULTS if k in stem), None)
         default_h_list.append(OBS_SENSOR_HEIGHT_DEFAULTS.get(sid, 0.10))
     else:
-        site = next((k for k in HOBO_SENSOR_HEIGHT_DEFAULTS if k.lower() in stem.lower()), None)
-        default_h_list.append(HOBO_SENSOR_HEIGHT_DEFAULTS.get(site, 0.10))
+        # Hobo sensors are fixed on the river bed — no height correction needed
+        default_h_list.append(HOBO_SENSOR_HEIGHT_DEFAULT)
 
 default_fw_list: list[str] = [
     file_obs_firmware.get(fn, ("new",))[0] if file_format[fn] == "obs_txt" else "—"
@@ -741,16 +740,21 @@ fw_overrides     = st.session_state["obs_fw_overrides"]
 bc1, bc2, _bc3 = st.columns([2, 1, 3])
 with bc1:
     batch_h = st.number_input(
-        "Set ALL sensor heights to (m):",
+        "Set OBS sensor heights to (m):",
         min_value=0.0, max_value=5.0,
         value=0.10, step=0.005, format="%.3f",
         key="batch_height_input",
-        help="Applies the same height to every file at once — useful when sensor position did not change.",
+        help="Applies the same height to every **OBS** file at once. "
+             "Hobo sensors are fixed at 0.000 m (sensor sits on the river bed).",
     )
 with bc2:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("✅ Apply to all", key="apply_batch_heights"):
-        st.session_state["sensor_heights"] = {fn: batch_h for fn in parseable}
+    if st.button("✅ Apply to OBS", key="apply_batch_heights"):
+        updated = dict(st.session_state["sensor_heights"])
+        for fn in parseable:
+            if file_format[fn] == "obs_txt":
+                updated[fn] = batch_h
+        st.session_state["sensor_heights"] = updated
         st.rerun()
 
 # ── Editable settings table ────────────────────────────────────────────────────
@@ -762,7 +766,11 @@ height_df = pd.DataFrame({
         "OBS" if file_format[n] == "obs_txt" else "Hobo CSV"
         for n in parseable
     ],
-    "Sensor_height_m": [current_heights.get(fn, h) for fn, h in zip(parseable, default_h_list)],
+    "Sensor_height_m": [
+        HOBO_SENSOR_HEIGHT_DEFAULT if file_format[fn] == "hobo_csv"
+        else current_heights.get(fn, h)
+        for fn, h in zip(parseable, default_h_list)
+    ],
     "OBS_firmware":    [fw_overrides.get(fn, fw) for fn, fw in zip(parseable, default_fw_list)],
 })
 edited = st.data_editor(
@@ -775,6 +783,8 @@ edited = st.data_editor(
         "Sensor_height_m": st.column_config.NumberColumn(
             "Sensor Height (m)", min_value=0.0, max_value=5.0,
             step=0.005, format="%.3f",
+            help="OBS only — edit the height above bed.  Hobo sensors sit on the bed and are "
+                 "always locked to 0.000 m (any edits are ignored).",
         ),
         "OBS_firmware": st.column_config.SelectboxColumn(
             "OBS Firmware",
@@ -786,8 +796,11 @@ edited = st.data_editor(
     use_container_width=True,
     key="height_editor",
 )
-# Persist edits back to session state
-st.session_state["sensor_heights"]   = dict(zip(edited["File"], edited["Sensor_height_m"]))
+# Persist edits back to session state; force Hobo heights to 0.0 regardless of user input
+st.session_state["sensor_heights"] = {
+    fn: (HOBO_SENSOR_HEIGHT_DEFAULT if file_format[fn] == "hobo_csv" else h)
+    for fn, h in zip(edited["File"], edited["Sensor_height_m"])
+}
 st.session_state["obs_fw_overrides"] = dict(zip(edited["File"], edited["OBS_firmware"]))
 file_heights      = st.session_state["sensor_heights"]
 file_fw_overrides = st.session_state["obs_fw_overrides"]
