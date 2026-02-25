@@ -43,11 +43,10 @@ PALETTE = [
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
 ]
 
-# OBS firmware cutoff: sensors with firmware before this date AND pressure > threshold
-# stored raw pressure in Pa-equivalent units (÷100 to get mbar).
-# Newer sensors (from ~mid-July 2025) store pressure in 0.1-mbar units (÷10).
-OBS_OLD_FIRMWARE_CUTOFF   = pd.Timestamp("2025-07-15")
-OBS_FW_PRESSURE_THRESHOLD = 50_000       # median raw pressure above this → old firmware
+# OBS firmware detection threshold:
+#   first raw pressure reading > 50 000  →  old firmware, ÷100 to get mbar  (~85 000 range)
+#   first raw pressure reading ≤ 50 000  →  new firmware, ÷10  to get mbar  (~8 500  range)
+OBS_FW_PRESSURE_THRESHOLD = 50_000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Format detection
@@ -95,48 +94,44 @@ def detect_obs_firmware(file_bytes: bytes) -> tuple[str, str | None]:
     """
     Returns ('old'|'new', firmware_date_str|None).
 
-    Detection rules (BOTH required for 'old'):
-      1. Median raw Pressure column > OBS_FW_PRESSURE_THRESHOLD (50 000)
-      2. Parsed 'Firmware updated:' date is before OBS_OLD_FIRMWARE_CUTOFF (2025-07-15),
-         OR the header has no firmware date at all.
+    Detection rule: inspect the first pressure reading in the data.
+      • first_pressure > OBS_FW_PRESSURE_THRESHOLD (50 000)  →  'old'  (÷100 to mbar)
+      • first_pressure ≤ OBS_FW_PRESSURE_THRESHOLD           →  'new'  (÷10  to mbar)
 
-    Old firmware (pre Jul-2025): pressure stored in Pa-equivalent units  → divide by 100
-    New firmware (post Jul-2025): pressure stored in 0.1-mbar units      → divide by 10
+    Old firmware: raw pressure ~85 000  (Pa-equivalent units)
+    New firmware: raw pressure ~8 500   (0.1-mbar units)
     """
     text = file_bytes.decode("utf-8", errors="replace")
 
-    # Parse 'Firmware updated: YYYY/MM/DD' from the comment header
+    # Parse 'Firmware updated: YYYY/MM/DD' from the comment header (display only)
     fw_match    = re.search(r"Firmware\s+updated:\s*(\d{4}/\d{2}/\d{2})", text, re.IGNORECASE)
     fw_date_str = fw_match.group(1) if fw_match else None
-    fw_date     = pd.Timestamp(fw_date_str.replace("/", "-")) if fw_date_str else None
 
-    # Parse median pressure from the data rows
+    # Find data header row, then read only the first data line
     lines      = text.splitlines()
     header_idx = next(
         (i for i, ln in enumerate(lines)
          if re.match(r"^\s*time\s*,", ln, re.IGNORECASE)),
         None,
     )
-    median_pressure: float | None = None
+    first_pressure: float | None = None
     if header_idx is not None:
         try:
-            df_tmp = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-            df_tmp.columns = [c.strip().lower() for c in df_tmp.columns]
-            if "pressure" in df_tmp.columns:
-                median_pressure = pd.to_numeric(
-                    df_tmp["pressure"], errors="coerce"
-                ).median()
+            headers = [c.strip().lower() for c in lines[header_idx].split(",")]
+            if "pressure" in headers:
+                p_col = headers.index("pressure")
+                for ln in lines[header_idx + 1:]:
+                    parts = ln.split(",")
+                    if len(parts) > p_col and parts[p_col].strip():
+                        first_pressure = float(parts[p_col].strip())
+                        break
         except Exception:
             pass
 
-    is_old_pressure = (
-        median_pressure is not None
-        and median_pressure > OBS_FW_PRESSURE_THRESHOLD
+    firmware = (
+        "old" if (first_pressure is not None and first_pressure > OBS_FW_PRESSURE_THRESHOLD)
+        else "new"
     )
-    # If no firmware date found, treat as potentially old (be conservative)
-    is_old_date = fw_date is None or fw_date < OBS_OLD_FIRMWARE_CUTOFF
-
-    firmware = "old" if (is_old_pressure and is_old_date) else "new"
     return firmware, fw_date_str
 
 
