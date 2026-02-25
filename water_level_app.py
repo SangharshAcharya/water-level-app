@@ -1,0 +1,1043 @@
+"""
+Water Level Analysis Web App  (S4W-Nepal)
+==========================================
+Single-upload interface that auto-detects file type and applies the correct
+pressure → water-level formula.
+
+File types handled
+------------------
+• OBS  (.txt)            OpenOBS logger, Unix-timestamp CSV
+• Hobo (.csv / .txt→)   HOBOware-exported CSV (Abs Pres, kPa)
+• Hobo (.hobo)           Onset binary – metadata extracted, data export instructions shown
+
+Atmospheric pressure source
+---------------------------
+• Default Kathmandu Valley value (~86 kPa)
+• Upload METER ATMOS 41 Atmospheric_pressure.csv
+"""
+
+import io
+import re
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_ATM_KPA = 86.0    # Kathmandu Valley approximate atmospheric pressure
+GRAVITY_KPA     = 9.80665  # kPa per metre of water column (rho=1000, g=9.80665)
+GRAVITY_OBS     = 9.80665e3  # for OBS mbar formula
+
+OBS_SENSOR_HEIGHT_DEFAULTS = {
+    "303": 0.08, "469": 0.10, "470": 0.10,
+    "300": 0.10, "301": 0.10, "304": 0.10, "455": 0.10, "467": 0.10,
+}
+HOBO_SENSOR_HEIGHT_DEFAULTS = {
+    "Gonsal": 0.10, "Maheshwari": 0.10, "RadheRadhe": 0.10,
+}
+
+PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+# OBS firmware cutoff: sensors with firmware before this date AND pressure > threshold
+# stored raw pressure in Pa-equivalent units (÷100 to get mbar).
+# Newer sensors (from ~mid-July 2025) store pressure in 0.1-mbar units (÷10).
+OBS_OLD_FIRMWARE_CUTOFF   = pd.Timestamp("2025-07-15")
+OBS_FW_PRESSURE_THRESHOLD = 50_000       # median raw pressure above this → old firmware
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Format detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_format(file_bytes: bytes, filename: str) -> str:
+    """
+    Returns one of: 'obs_txt' | 'hobo_csv' | 'hobo_binary' | 'unknown'
+
+    Priority:
+      1. HOBO binary magic bytes → 'hobo_binary'
+      2. Contains 'time,' + 'ambient_light' header → 'obs_txt'
+      3. Contains 'Date Time' + 'Abs Pres' → 'hobo_csv'
+      4. .txt with 'time,' header (minimal OBS firmware) → 'obs_txt'
+      5. Fallback → 'unknown'
+    """
+    if file_bytes[:4] == b"HOBO":
+        return "hobo_binary"
+
+    try:
+        text = file_bytes[:3000].decode("utf-8", errors="replace")
+    except Exception:
+        return "unknown"
+
+    if re.search(r"time\s*,\s*ambient_light", text, re.IGNORECASE):
+        return "obs_txt"
+
+    if re.search(r"Date\s*Time", text, re.IGNORECASE) and re.search(
+        r"Abs.?Pres", text, re.IGNORECASE
+    ):
+        return "hobo_csv"
+
+    ext = filename.rsplit(".", 1)[-1].lower()
+    if ext == "txt" and re.search(r"^\s*time\s*,", text, re.IGNORECASE | re.MULTILINE):
+        return "obs_txt"
+
+    return "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBS firmware version detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_obs_firmware(file_bytes: bytes) -> tuple[str, str | None]:
+    """
+    Returns ('old'|'new', firmware_date_str|None).
+
+    Detection rules (BOTH required for 'old'):
+      1. Median raw Pressure column > OBS_FW_PRESSURE_THRESHOLD (50 000)
+      2. Parsed 'Firmware updated:' date is before OBS_OLD_FIRMWARE_CUTOFF (2025-07-15),
+         OR the header has no firmware date at all.
+
+    Old firmware (pre Jul-2025): pressure stored in Pa-equivalent units  → divide by 100
+    New firmware (post Jul-2025): pressure stored in 0.1-mbar units      → divide by 10
+    """
+    text = file_bytes.decode("utf-8", errors="replace")
+
+    # Parse 'Firmware updated: YYYY/MM/DD' from the comment header
+    fw_match    = re.search(r"Firmware\s+updated:\s*(\d{4}/\d{2}/\d{2})", text, re.IGNORECASE)
+    fw_date_str = fw_match.group(1) if fw_match else None
+    fw_date     = pd.Timestamp(fw_date_str.replace("/", "-")) if fw_date_str else None
+
+    # Parse median pressure from the data rows
+    lines      = text.splitlines()
+    header_idx = next(
+        (i for i, ln in enumerate(lines)
+         if re.match(r"^\s*time\s*,", ln, re.IGNORECASE)),
+        None,
+    )
+    median_pressure: float | None = None
+    if header_idx is not None:
+        try:
+            df_tmp = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+            df_tmp.columns = [c.strip().lower() for c in df_tmp.columns]
+            if "pressure" in df_tmp.columns:
+                median_pressure = pd.to_numeric(
+                    df_tmp["pressure"], errors="coerce"
+                ).median()
+        except Exception:
+            pass
+
+    is_old_pressure = (
+        median_pressure is not None
+        and median_pressure > OBS_FW_PRESSURE_THRESHOLD
+    )
+    # If no firmware date found, treat as potentially old (be conservative)
+    is_old_date = fw_date is None or fw_date < OBS_OLD_FIRMWARE_CUTOFF
+
+    firmware = "old" if (is_old_pressure and is_old_date) else "new"
+    return firmware, fw_date_str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBS parser & water-level formula
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_obs_txt(
+    file_bytes: bytes, filename: str
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Returns (raw_df, error_msg).
+    raw_df columns: Date, Time_unix, Ambient_light, Backscatter, Pressure,
+                    Water_temp, Battery, Source_file
+    """
+    text  = file_bytes.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+
+    header_idx = next(
+        (i for i, ln in enumerate(lines) if re.match(r"^\s*time\s*,", ln, re.IGNORECASE)),
+        None,
+    )
+    if header_idx is None:
+        return None, f"No `time,` header found in **{filename}**"
+
+    try:
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    except Exception as e:
+        return None, f"CSV parse error in {filename}: {e}"
+
+    df.columns = [c.strip().lower() for c in df.columns]
+    df.rename(columns={
+        "time":         "Time_unix",
+        "ambient_light":"Ambient_light",
+        "backscatter":  "Backscatter",
+        "pressure":     "Pressure",
+        "water_temp":   "Water_temp",
+        "battery":      "Battery",
+    }, inplace=True)
+
+    if "Time_unix" not in df.columns or "Pressure" not in df.columns:
+        return None, f"Missing required columns in {filename}"
+
+    df["Date"] = pd.to_datetime(df["Time_unix"], unit="s", origin="unix", errors="coerce")
+    df.dropna(subset=["Date"], inplace=True)
+
+    for c in ["Ambient_light", "Backscatter", "Pressure", "Water_temp", "Battery"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["Source_file"] = filename
+    ordered = ["Date", "Time_unix", "Ambient_light", "Backscatter", "Pressure",
+               "Water_temp", "Battery", "Source_file"]
+    return df[[c for c in ordered if c in df.columns]], None
+
+
+def calc_water_level_obs(
+    df: pd.DataFrame,
+    sensor_height: float,
+    baro: pd.DataFrame | None,
+    default_atm_kpa: float,
+    firmware: str = "new",
+) -> pd.DataFrame:
+    """
+    OBS water-level formula — two firmware variants.
+
+    New firmware (post ~Jul-2025, pressure ~8 600 units = 0.1 mbar each):
+        hydroP_mbar   = Pressure / 10   - Atm_kPa * 10
+
+    Old firmware (pre ~Jul-2025, pressure ~85 000 units ≈ Pa / 0.01 mbar each):
+        hydroP_mbar   = Pressure / 100  - Atm_kPa * 10
+
+    Then (both variants):
+        Water_level_m = hydroP_mbar / 1000 / 9806.65 * 1e5 + h_sensor
+    """
+    divisor = 100.0 if firmware == "old" else 10.0
+    df = df.copy().sort_values("Date")
+    df = _merge_baro(df, baro, default_atm_kpa)
+    df["hydroP_mbar"]   = df["Pressure"] / divisor - (df["Atm_kPa"] * 10.0)
+    df["Water_level_m"] = df["hydroP_mbar"] / 1000.0 / GRAVITY_OBS * 1e5 + sensor_height
+    df["Sensor_height_m"] = sensor_height
+    df["OBS_firmware"]    = firmware
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hobo CSV parser & water-level formula
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_hobo_csv(
+    file_bytes: bytes, filename: str
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Returns (raw_df, error_msg).
+    raw_df columns: Date, Abs_Pres_kPa, Temp_C, Source_file
+    """
+    text  = file_bytes.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+
+    header_idx = next(
+        (i for i, ln in enumerate(lines)
+         if re.search(r"Date\s*Time", ln, re.IGNORECASE)),
+        None,
+    )
+    if header_idx is None:
+        return None, f"No 'Date Time' header found in **{filename}**"
+
+    try:
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip")
+    except Exception as e:
+        return None, f"CSV parse error in {filename}: {e}"
+
+    df.columns = [c.strip() for c in df.columns]
+
+    date_col = next((c for c in df.columns if "Date Time" in c), None)
+    pres_col = next(
+        (c for c in df.columns
+         if re.search(r"abs.?pres", c, re.IGNORECASE)
+         or re.search(r"pressure", c, re.IGNORECASE)),
+        None,
+    )
+    temp_col = next(
+        (c for c in df.columns
+         if re.search(r"temp", c, re.IGNORECASE) and "Date" not in c),
+        None,
+    )
+
+    if date_col is None:
+        return None, f"No 'Date Time' column found in {filename}"
+    if pres_col is None:
+        return None, (
+            f"No absolute pressure column ('Abs Pres, kPa') found in {filename}. "
+            "Make sure you exported a HOBO U20L Water Level CSV from HOBOware."
+        )
+
+    df["Date"]        = pd.to_datetime(df[date_col], errors="coerce")
+    df.dropna(subset=["Date"], inplace=True)
+    df["Abs_Pres_kPa"] = pd.to_numeric(df[pres_col], errors="coerce")
+    df["Temp_C"]       = pd.to_numeric(df[temp_col], errors="coerce") if temp_col else np.nan
+    df["Source_file"]  = filename
+
+    result = df[["Date", "Abs_Pres_kPa", "Temp_C", "Source_file"]].dropna(subset=["Abs_Pres_kPa"])
+    return result.sort_values("Date").reset_index(drop=True), None
+
+
+def calc_water_level_hobo(
+    df: pd.DataFrame,
+    sensor_height: float,
+    baro: pd.DataFrame | None,
+    default_atm_kpa: float,
+) -> pd.DataFrame:
+    """
+    Hobo U20L formula:
+        Hydro_kPa     = Abs_Pres_kPa - Atm_kPa
+        Water_level_m = Hydro_kPa / 9.80665 + h_sensor
+    """
+    df = df.copy().sort_values("Date")
+    df = _merge_baro(df, baro, default_atm_kpa)
+    df["Hydro_kPa"]     = df["Abs_Pres_kPa"] - df["Atm_kPa"]
+    df["Water_level_m"] = df["Hydro_kPa"] / GRAVITY_KPA + sensor_height
+    df["Sensor_height_m"] = sensor_height
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hobo binary metadata extractor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_hobo_binary_metadata(file_bytes: bytes) -> dict:
+    """
+    Parse readable strings from Onset binary .hobo to extract device metadata.
+    Returns a dict suitable for display as a table.
+    """
+    strings  = re.findall(rb"[\x20-\x7e]{4,}", file_bytes)
+    readable = [s.decode("ascii", errors="replace").strip() for s in strings]
+
+    meta: dict = {"File size (bytes)": len(file_bytes)}
+    for s in readable:
+        if "HOBO" in s and "Water Level" in s:
+            meta["Device"] = s
+        elif "Onset" in s and "Device" not in meta:
+            meta["Manufacturer"] = s
+        elif re.match(r"^\d{7,10}$", s):
+            meta.setdefault("Serial number", s)
+        elif "HOBOware" in s:
+            meta["Software"] = s
+        elif "Time" in s and len(s) < 30:
+            meta["Timezone"] = s
+        elif s and not any(kw in s for kw in [
+            "HOBOware", "HOBO", "Onset", "Time", "\\", "Corporation"
+        ]) and len(s) > 3:
+            meta.setdefault("Deployment note", s)
+
+    return meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atmospheric pressure loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_baro_csv(file_obj) -> pd.DataFrame | None:
+    """Load METER ATMOS 41 Atmospheric_pressure.csv (2-row header)."""
+    try:
+        content = file_obj.read()
+        baro    = pd.read_csv(io.BytesIO(content), skiprows=2, parse_dates=["Timestamps"])
+        baro.columns = [c.strip() for c in baro.columns]
+        baro.rename(columns={
+            "Timestamps": "DateTime",
+            "kPa Atmospheric Pressure": "Atm_kPa",
+        }, inplace=True)
+        if "Atm_kPa" not in baro.columns:
+            st.error("'kPa Atmospheric Pressure' column not found in barometric CSV.")
+            return None
+        return baro[["DateTime", "Atm_kPa"]].dropna().sort_values("DateTime")
+    except Exception as e:
+        st.error(f"Error loading barometric pressure file: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _merge_baro(
+    df: pd.DataFrame, baro: pd.DataFrame | None, default_kpa: float
+) -> pd.DataFrame:
+    if baro is not None:
+        df = pd.merge_asof(
+            df,
+            baro.rename(columns={"DateTime": "Date", "Atm_kPa": "_Atm"}),
+            on="Date", direction="nearest",
+        )
+        df["Atm_kPa"] = df["_Atm"].fillna(default_kpa)
+        df.drop(columns=["_Atm"], inplace=True)
+    else:
+        df["Atm_kPa"] = default_kpa
+    return df
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    return buf.getvalue()
+
+
+def download_pair(
+    label: str,
+    df: pd.DataFrame,
+    stem: str,
+    key: str,
+):
+    """Render CSV + Excel download buttons side by side."""
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            f"⬇ {label} — CSV",
+            data=to_csv_bytes(df),
+            file_name=f"{stem}.csv",
+            mime="text/csv",
+            key=f"csv_{key}",
+        )
+    with c2:
+        st.download_button(
+            f"⬇ {label} — Excel",
+            data=to_excel_bytes(df),
+            file_name=f"{stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"xlsx_{key}",
+        )
+
+
+def wl_timeseries_fig(
+    df: pd.DataFrame,
+    file_col: str,
+    heights: dict,
+    offset: int = 0,
+) -> go.Figure:
+    """Interactive water-level timeseries, one trace per file."""
+    files = df[file_col].unique().tolist()
+    fig   = go.Figure()
+    for i, fn in enumerate(files):
+        seg = df[df[file_col] == fn]
+        sh  = heights.get(fn, 0.10)
+        fig.add_trace(go.Scatter(
+            x=seg["Date"], y=seg["Water_level_m"],
+            mode="lines",
+            name=f"{fn}  (h={sh:.3f} m)",
+            line=dict(color=PALETTE[(offset + i) % len(PALETTE)], width=1.5),
+            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<extra></extra>",
+        ))
+    fig.update_layout(
+        xaxis_title="Date / Time", yaxis_title="Water Level (m)",
+        height=420, hovermode="x unified", template="plotly_white",
+        margin=dict(t=30, b=40),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Water Level Analysis — S4W-Nepal",
+    page_icon="💧",
+    layout="wide",
+)
+st.title("💧 Water Level Analysis — S4W-Nepal")
+st.caption(
+    "Upload **OBS** (`.txt`) and/or **Hobo** (HOBOware-exported `.csv`, or raw `.hobo`) files. "
+    "File types are detected automatically and the correct formula is applied to each."
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    st.subheader("Atmospheric Pressure")
+
+    atm_mode = st.radio(
+        "Source",
+        ["Default Kathmandu value", "Upload atmospheric pressure CSV"],
+        index=0,
+    )
+    default_atm_kpa = st.number_input(
+        "Default pressure (kPa)",
+        min_value=70.0, max_value=110.0,
+        value=DEFAULT_ATM_KPA, step=0.1,
+        help="Used when no CSV is provided, or as fallback for gaps in CSV coverage.",
+    )
+
+    baro_df: pd.DataFrame | None = None
+    if atm_mode == "Upload atmospheric pressure CSV":
+        baro_file = st.file_uploader(
+            "Atmospheric_pressure.csv",
+            type=["csv"],
+            help="METER ATMOS 41 export — must contain 'kPa Atmospheric Pressure' column.",
+        )
+        if baro_file:
+            baro_df = load_baro_csv(baro_file)
+            if baro_df is not None:
+                st.success(
+                    f"✅ {len(baro_df):,} baro records  \n"
+                    f"{baro_df['DateTime'].min().date()} → "
+                    f"{baro_df['DateTime'].max().date()}"
+                )
+
+    st.divider()
+    st.markdown(
+        """
+**Auto-detected formats**
+
+| Extension | Detected as |
+|-----------|-------------|
+| `.txt` | OBS logger |
+| `.csv` (HOBOware) | Hobo CSV |
+| `.hobo` | Onset binary ⚠️ |
+
+> Binary `.hobo` files are identified automatically. Metadata is extracted and shown.
+> To get the full data, export the file to CSV from **HOBOware** and re-upload.
+        """
+    )
+
+    st.divider()
+    st.subheader("🌐 Share this app")
+    st.markdown(
+        """
+**Option A — Local network (same building)**
+
+Stop the app, then run:
+```
+streamlit run water_level_app.py --server.address 0.0.0.0 --server.port 8502
+```
+Anyone on the **same Wi-Fi / LAN** can open:
+`http://<your-PC-IP>:8502`
+
+Find your IP with `ipconfig` → look for *IPv4 Address*.
+
+---
+
+**Option B — Internet (different Wi-Fi)**
+
+1. Push `water_level_app.py` to a **GitHub** repository  
+2. Go to [share.streamlit.io](https://share.streamlit.io) → *New app*  
+3. Connect the repo — Streamlit Community Cloud hosts it **free**  
+4. Share the generated `*.streamlit.app` URL with anyone
+
+Add a `requirements.txt` next to the app file:
+```
+streamlit
+plotly
+pandas
+numpy
+openpyxl
+```
+        """
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File uploader
+# ─────────────────────────────────────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "Upload sensor files  ·  OBS `.txt`  ·  Hobo HOBOware `.csv`  ·  raw Hobo `.hobo`",
+    type=["txt", "csv", "hobo"],
+    accept_multiple_files=True,
+    help="Mix of OBS and Hobo files is supported. Each file is auto-detected and processed independently.",
+)
+
+if not uploaded:
+    st.info("👆 Upload one or more sensor files to begin.")
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-detect formats
+# ─────────────────────────────────────────────────────────────────────────────
+file_cache:  dict[str, bytes] = {}
+file_format: dict[str, str]   = {}
+
+for uf in uploaded:
+    raw = uf.read()
+    file_cache[uf.name]  = raw
+    file_format[uf.name] = detect_format(raw, uf.name)
+
+obs_names  = [n for n, fmt in file_format.items() if fmt == "obs_txt"]
+hobo_names = [n for n, fmt in file_format.items() if fmt == "hobo_csv"]
+bin_names  = [n for n, fmt in file_format.items() if fmt == "hobo_binary"]
+unk_names  = [n for n, fmt in file_format.items() if fmt == "unknown"]
+
+# Detect OBS firmware version for each OBS file
+file_obs_firmware: dict[str, tuple[str, str | None]] = {}
+for _n in obs_names:
+    file_obs_firmware[_n] = detect_obs_firmware(file_cache[_n])
+
+# Detection summary
+fmt_labels = {
+    "obs_txt":     "✅ OBS logger (.txt)",
+    "hobo_csv":    "✅ Hobo HOBOware CSV",
+    "hobo_binary": "⚠️ Hobo binary — export to CSV first",
+    "unknown":     "❌ Unknown — will be skipped",
+}
+det_rows: list[dict] = []
+for _n in [u.name for u in uploaded]:
+    _row: dict = {
+        "File":        _n,
+        "Detected as": fmt_labels.get(file_format[_n], file_format[_n]),
+        "OBS Firmware": "—",
+    }
+    if file_format[_n] == "obs_txt":
+        _fw, _fw_date = file_obs_firmware.get(_n, ("new", None))
+        _fw_tag = "🔴 Old (÷100)" if _fw == "old" else "🟢 New (÷10)"
+        if _fw_date:
+            _fw_tag += f"  FW: {_fw_date}"
+        _row["OBS Firmware"] = _fw_tag
+    det_rows.append(_row)
+det_df = pd.DataFrame(det_rows)
+with st.expander("🔍 Auto-detected file formats", expanded=True):
+    st.table(det_df)
+    if any(file_obs_firmware.get(_n, ("new",))[0] == "old" for _n in obs_names):
+        st.warning(
+            "⚠️ One or more OBS files detected as **old firmware** "
+            "(median pressure > 50 000, firmware date before 15 Jul 2025). "
+            "Pressure divisor set to **100** (Pa units). "
+            "You can override the firmware version per-file in the Sensor Settings table below."
+        )
+
+if unk_names:
+    st.warning("Skipping unrecognised files: " + ", ".join(f"`{f}`" for f in unk_names))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary .hobo — metadata panel (always shown immediately)
+# ─────────────────────────────────────────────────────────────────────────────
+if bin_names:
+    st.markdown("---")
+    st.subheader("⚠️ Binary Hobo Files")
+    st.error(
+        "**Binary `.hobo` files cannot be decoded directly** — Onset's format is proprietary "
+        "and requires the HOBOware SDK.\n\n"
+        "**To get your data into this app:**\n"
+        "1. Connect the Hobo U20L logger to your PC via the optical USB coupler\n"
+        "2. Open **HOBOware** → *Device* → *Readout device*\n"
+        "3. Click **Export** → **Text/CSV** → save the `.csv` file\n"
+        "4. Re-upload the exported `.csv` here — it will be processed automatically\n\n"
+        "Metadata extracted from the binary file(s) is shown below.",
+        icon="⚠️",
+    )
+    for fname in bin_names:
+        meta = extract_hobo_binary_metadata(file_cache[fname])
+        with st.expander(f"📋 Metadata — {fname}", expanded=True):
+            meta_rows = pd.DataFrame(
+                [{"Property": k, "Value": str(v)} for k, v in meta.items()]
+            )
+            st.table(meta_rows)
+            st.download_button(
+                "⬇ Download metadata as CSV",
+                data=to_csv_bytes(meta_rows),
+                file_name=fname.replace(".hobo", "_metadata.csv"),
+                mime="text/csv",
+                key=f"meta_{fname}",
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sensor height editor
+# ─────────────────────────────────────────────────────────────────────────────
+parseable = obs_names + hobo_names
+if not parseable:
+    st.info("No parseable files yet. Upload OBS `.txt` or HOBOware CSV files.")
+    st.stop()
+
+st.markdown("---")
+st.subheader("📏 Sensor Settings")
+st.caption(
+    "Set the sensor height (distance from sensor face to channel bed, metres) for each file. "
+    "Use **Set ALL heights to** for a quick batch update when no repositioning occurred between offloads. "
+    "The OBS Firmware column is auto-detected — override it here if you know it is wrong."
+)
+
+# ── Build default lists ────────────────────────────────────────────────────────
+default_h_list: list[float] = []
+for fn in parseable:
+    stem = fn.rsplit(".", 1)[0]
+    if file_format[fn] == "obs_txt":
+        sid = next((k for k in OBS_SENSOR_HEIGHT_DEFAULTS if k in stem), None)
+        default_h_list.append(OBS_SENSOR_HEIGHT_DEFAULTS.get(sid, 0.10))
+    else:
+        site = next((k for k in HOBO_SENSOR_HEIGHT_DEFAULTS if k.lower() in stem.lower()), None)
+        default_h_list.append(HOBO_SENSOR_HEIGHT_DEFAULTS.get(site, 0.10))
+
+default_fw_list: list[str] = [
+    file_obs_firmware.get(fn, ("new",))[0] if file_format[fn] == "obs_txt" else "—"
+    for fn in parseable
+]
+
+# ── Session-state backed heights (reset whenever file list changes) ────────────
+_file_key = tuple(sorted(parseable))
+if st.session_state.get("_sensor_files_key") != _file_key:
+    st.session_state["_sensor_files_key"]  = _file_key
+    st.session_state["sensor_heights"]     = dict(zip(parseable, default_h_list))
+    st.session_state["obs_fw_overrides"]   = dict(zip(parseable, default_fw_list))
+
+current_heights  = st.session_state["sensor_heights"]
+fw_overrides     = st.session_state["obs_fw_overrides"]
+
+# ── Batch height setter ────────────────────────────────────────────────────────
+bc1, bc2, _bc3 = st.columns([2, 1, 3])
+with bc1:
+    batch_h = st.number_input(
+        "Set ALL sensor heights to (m):",
+        min_value=0.0, max_value=5.0,
+        value=0.10, step=0.005, format="%.3f",
+        key="batch_height_input",
+        help="Applies the same height to every file at once — useful when sensor position did not change.",
+    )
+with bc2:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("✅ Apply to all", key="apply_batch_heights"):
+        st.session_state["sensor_heights"] = {fn: batch_h for fn in parseable}
+        st.rerun()
+
+# ── Editable settings table ────────────────────────────────────────────────────
+height_df = pd.DataFrame({
+    "File":            parseable,
+    "Type":            [
+        "OBS" if file_format[n] == "obs_txt" else "Hobo CSV"
+        for n in parseable
+    ],
+    "Sensor_height_m": [current_heights.get(fn, h) for fn, h in zip(parseable, default_h_list)],
+    "OBS_firmware":    [fw_overrides.get(fn, fw) for fn, fw in zip(parseable, default_fw_list)],
+})
+edited = st.data_editor(
+    height_df,
+    column_config={
+        "File": st.column_config.TextColumn("File", disabled=True),
+        "Type": st.column_config.TextColumn("Type", disabled=True),
+        "Sensor_height_m": st.column_config.NumberColumn(
+            "Sensor Height (m)", min_value=0.0, max_value=5.0,
+            step=0.005, format="%.3f",
+        ),
+        "OBS_firmware": st.column_config.SelectboxColumn(
+            "OBS Firmware",
+            options=["new", "old", "—"],
+            help="'new' ÷10 (post July 2025, ~8 600 units).  'old' ÷100 (pre July 2025, ~85 000 Pa units).  '—' for Hobo files.",
+        ),
+    },
+    hide_index=True,
+    use_container_width=True,
+    key="height_editor",
+)
+# Persist edits back to session state
+st.session_state["sensor_heights"]   = dict(zip(edited["File"], edited["Sensor_height_m"]))
+st.session_state["obs_fw_overrides"] = dict(zip(edited["File"], edited["OBS_firmware"]))
+file_heights      = st.session_state["sensor_heights"]
+file_fw_overrides = st.session_state["obs_fw_overrides"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Process button
+# ─────────────────────────────────────────────────────────────────────────────
+if st.button("▶ Process All Files", type="primary"):
+    results_list: list[dict] = []
+    prog = st.progress(0, text="Initialising…")
+
+    for idx, fname in enumerate(parseable):
+        prog.progress(idx / len(parseable), text=f"Processing {fname}…")
+        sh  = file_heights.get(fname, 0.10)
+        fmt = file_format[fname]
+        fb  = file_cache[fname]
+
+        if fmt == "obs_txt":
+            raw, err = parse_obs_txt(fb, fname)
+            if err:
+                st.error(f"**{fname}**: {err}")
+                continue
+            fw_val = file_fw_overrides.get(fname, "new")
+            if fw_val not in ("old", "new"):          # e.g. '—' shouldn't happen for OBS
+                fw_val = file_obs_firmware.get(fname, ("new",))[0]
+            processed = calc_water_level_obs(raw, sh, baro_df, default_atm_kpa, firmware=fw_val)
+        else:
+            raw, err = parse_hobo_csv(fb, fname)
+            if err:
+                st.error(f"**{fname}**: {err}")
+                continue
+            processed = calc_water_level_hobo(raw, sh, baro_df, default_atm_kpa)
+
+        processed["Offload_file"] = fname
+        raw["Offload_file"]       = fname
+        results_list.append({
+            "name": fname, "fmt": fmt,
+            "raw": raw, "processed": processed,
+        })
+
+    prog.progress(1.0, text="Done.")
+
+    if not results_list:
+        st.error("No data could be processed from the uploaded files.")
+        st.stop()
+
+    st.session_state["results"] = results_list
+    total = sum(len(r["processed"]) for r in results_list)
+    st.success(f"✅ {total:,} records processed from {len(results_list)} file(s).")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Results
+# ─────────────────────────────────────────────────────────────────────────────
+if "results" not in st.session_state:
+    st.stop()
+
+results_list: list[dict] = st.session_state["results"]
+
+all_proc  = pd.concat([r["processed"] for r in results_list], ignore_index=True).sort_values("Date")
+raw_obs   = pd.concat(
+    [r["raw"] for r in results_list if r["fmt"] == "obs_txt"], ignore_index=True
+) if any(r["fmt"] == "obs_txt" for r in results_list) else pd.DataFrame()
+raw_hobo  = pd.concat(
+    [r["raw"] for r in results_list if r["fmt"] == "hobo_csv"], ignore_index=True
+) if any(r["fmt"] == "hobo_csv" for r in results_list) else pd.DataFrame()
+
+# ── Date-range filter ─────────────────────────────────────────────────────────
+st.markdown("---")
+fc1, fc2 = st.columns(2)
+with fc1:
+    start_d = st.date_input(
+        "Start date", value=all_proc["Date"].min().date(),
+        min_value=all_proc["Date"].min().date(),
+        max_value=all_proc["Date"].max().date(),
+    )
+with fc2:
+    end_d = st.date_input(
+        "End date", value=all_proc["Date"].max().date(),
+        min_value=all_proc["Date"].min().date(),
+        max_value=all_proc["Date"].max().date(),
+    )
+
+mask = (all_proc["Date"].dt.date >= start_d) & (all_proc["Date"].dt.date <= end_d)
+view = all_proc[mask].copy()
+
+if view.empty:
+    st.warning("No data in selected date range.")
+    st.stop()
+
+date_tag = f"{start_d}_{end_d}"
+
+# ── Metric cards ─────────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Records (filtered)", f"{len(view):,}")
+m2.metric("Max WL",  f"{view['Water_level_m'].max():.3f} m")
+m3.metric("Min WL",  f"{view['Water_level_m'].min():.3f} m")
+m4.metric("Mean WL", f"{view['Water_level_m'].mean():.3f} m")
+m5.metric("Files",   str(len(results_list)))
+
+# ── Combined water-level plot ─────────────────────────────────────────────────
+st.markdown("### 📈 Water Level Timeseries — All Files")
+st.plotly_chart(wl_timeseries_fig(view, "Offload_file", file_heights), use_container_width=True)
+
+# ── OBS sub-plots ─────────────────────────────────────────────────────────────
+obs_view = view[view["Offload_file"].isin(obs_names)].copy()
+if not obs_view.empty:
+    with st.expander("📊 OBS — Pressure / Backscatter / Temperature sub-panels", expanded=False):
+        uniq = obs_view["Offload_file"].unique().tolist()
+        fig_obs = make_subplots(
+            rows=4, cols=1, shared_xaxes=True,
+            subplot_titles=("Water Level (m)", "Raw Pressure", "Backscatter", "Water Temp (raw)"),
+            vertical_spacing=0.06,
+        )
+        for i, fn in enumerate(uniq):
+            seg = obs_view[obs_view["Offload_file"] == fn]
+            c   = PALETTE[i % len(PALETTE)]
+            for row, ycol in enumerate(
+                ["Water_level_m", "Pressure", "Backscatter", "Water_temp"], 1
+            ):
+                if ycol in seg.columns:
+                    fig_obs.add_trace(
+                        go.Scatter(
+                            x=seg["Date"], y=seg[ycol], mode="lines",
+                            name=fn, line=dict(color=c, width=1.2),
+                            showlegend=(row == 1),
+                        ),
+                        row=row, col=1,
+                    )
+        for row, lbl in enumerate(
+            ["WL (m)", "Pressure (raw)", "Backscatter", "Temp (raw)"], 1
+        ):
+            fig_obs.update_yaxes(title_text=lbl, row=row, col=1)
+        fig_obs.update_xaxes(title_text="Date / Time", row=4, col=1)
+        fig_obs.update_layout(
+            height=900, template="plotly_white",
+            hovermode="x unified", margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig_obs, use_container_width=True)
+
+# ── Hobo sub-plots ────────────────────────────────────────────────────────────
+hobo_view = view[view["Offload_file"].isin(hobo_names)].copy()
+if not hobo_view.empty:
+    with st.expander("📊 Hobo — Absolute Pressure / Temperature sub-panels", expanded=False):
+        uniq_h = hobo_view["Offload_file"].unique().tolist()
+        fig_hob = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            subplot_titles=("Water Level (m)", "Absolute Pressure (kPa)", "Water Temp (°C)"),
+            vertical_spacing=0.07,
+        )
+        for i, fn in enumerate(uniq_h):
+            seg = hobo_view[hobo_view["Offload_file"] == fn]
+            c   = PALETTE[(len(obs_names) + i) % len(PALETTE)]
+            for row, ycol in enumerate(["Water_level_m", "Abs_Pres_kPa", "Temp_C"], 1):
+                if ycol in seg.columns:
+                    fig_hob.add_trace(
+                        go.Scatter(
+                            x=seg["Date"], y=seg[ycol], mode="lines",
+                            name=fn, line=dict(color=c, width=1.2),
+                            showlegend=(row == 1),
+                        ),
+                        row=row, col=1,
+                    )
+        for row, lbl in enumerate(["WL (m)", "Abs Pres (kPa)", "Temp (°C)"], 1):
+            fig_hob.update_yaxes(title_text=lbl, row=row, col=1)
+        fig_hob.update_xaxes(title_text="Date / Time", row=3, col=1)
+        fig_hob.update_layout(
+            height=720, template="plotly_white",
+            hovermode="x unified", margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig_hob, use_container_width=True)
+
+# ── Atmospheric pressure overlay ──────────────────────────────────────────────
+if baro_df is not None:
+    with st.expander("🌡️ Atmospheric Pressure (uploaded CSV)", expanded=False):
+        bv = baro_df[
+            (baro_df["DateTime"].dt.date >= start_d) &
+            (baro_df["DateTime"].dt.date <= end_d)
+        ]
+        fig_b = go.Figure(go.Scatter(
+            x=bv["DateTime"], y=bv["Atm_kPa"],
+            mode="lines", line=dict(color="orange", width=1),
+        ))
+        fig_b.update_layout(
+            xaxis_title="Date / Time", yaxis_title="kPa",
+            height=240, template="plotly_white", margin=dict(t=20, b=30),
+        )
+        st.plotly_chart(fig_b, use_container_width=True)
+
+# ── Data table previews ───────────────────────────────────────────────────────
+with st.expander("🗃️ Processed Water-Level Table (preview)", expanded=False):
+    proc_cols = [
+        "Date", "Offload_file", "Sensor_height_m", "Atm_kPa", "Water_level_m",
+        "Pressure", "hydroP_mbar", "Ambient_light", "Backscatter", "Water_temp", "Battery",
+        "Abs_Pres_kPa", "Hydro_kPa", "Temp_C",
+    ]
+    avail = [c for c in proc_cols if c in view.columns]
+    st.dataframe(view[avail].head(500), use_container_width=True, height=320)
+
+if not raw_obs.empty:
+    with st.expander("🗃️ OBS Raw Data (preview)", expanded=False):
+        st.caption("Direct sensor output — no pressure conversion applied.")
+        st.dataframe(raw_obs.head(500), use_container_width=True, height=300)
+
+if not raw_hobo.empty:
+    with st.expander("🗃️ Hobo Raw Data (preview — HOBOware CSV columns)", expanded=False):
+        st.caption("Data exactly as exported from HOBOware — no conversion applied.")
+        st.dataframe(raw_hobo.head(500), use_container_width=True, height=300)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Downloads
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("💾 Downloads")
+
+# ── Combined processed (date-filtered) ───────────────────────────────────────
+st.markdown("#### Combined — Processed Water Level (date-filtered)")
+download_pair("All files · Processed WL", view, f"WaterLevel_all_{date_tag}", "all_proc")
+
+st.markdown("---")
+
+# ── Raw data — combined ────────────────────────────────────────────────────────
+if not raw_obs.empty:
+    st.markdown("#### OBS Raw Data — All OBS Files")
+    download_pair("OBS Raw", raw_obs, "OBS_raw_all", "obs_raw_combined")
+
+if not raw_hobo.empty:
+    st.markdown("#### Hobo Raw Data — All Hobo Files (HOBOware CSV)")
+    st.caption(
+        "This is the raw HOBOware export data (absolute pressure in kPa) "
+        "as parsed from the uploaded CSV, before any water-level conversion."
+    )
+    download_pair("Hobo Raw", raw_hobo, "Hobo_raw_all", "hobo_raw_combined")
+
+st.markdown("---")
+
+# ── Per-file downloads ────────────────────────────────────────────────────────
+st.markdown("#### Per-File Downloads")
+tabs = st.tabs([r["name"] for r in results_list])
+for tab, r in zip(tabs, results_list):
+    with tab:
+        stem      = r["name"].rsplit(".", 1)[0]
+        fmt_label = "OBS" if r["fmt"] == "obs_txt" else "Hobo"
+        st.markdown(f"**{fmt_label} · {r['name']}**")
+
+        st.markdown("*Raw sensor data (no water-level conversion)*")
+        download_pair("Raw", r["raw"], f"{stem}_raw", f"raw_{stem}")
+
+        proc_filt = r["processed"][
+            (r["processed"]["Date"].dt.date >= start_d) &
+            (r["processed"]["Date"].dt.date <= end_d)
+        ]
+        st.markdown(f"*Processed water level ({start_d} → {end_d})*")
+        download_pair(
+            "Processed WL", proc_filt,
+            f"{stem}_WaterLevel_{date_tag}",
+            f"proc_{stem}",
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# About
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("ℹ️ About — Formulas & Data Sources", expanded=False):
+    st.markdown(
+        r"""
+### OBS Sensor (OpenOBS `.txt`)
+Raw pressure is a dimensionless ADC integer — **two firmware variants exist**:
+
+**New firmware** (post ~July 2025, raw pressure ~8 600 units, divisor = 10):
+
+$$P_{hydro}\,(\text{mbar}) = \frac{P_{raw}}{10} - P_{atm}\,(\text{kPa}) \times 10$$
+
+**Old firmware** (pre ~July 2025, raw pressure ~85 000 units ≈ Pa, divisor = 100):
+
+$$P_{hydro}\,(\text{mbar}) = \frac{P_{raw}}{100} - P_{atm}\,(\text{kPa}) \times 10$$
+
+Both variants then:
+
+$$H\,(\text{m}) = \frac{P_{hydro}}{1000 \times 9806.65} \times 10^5 + h_{sensor}$$
+
+Auto-detection uses **median raw pressure > 50 000 AND firmware date before 15 Jul 2025**.
+Override the detected firmware version in the *Sensor Settings* table if needed.
+
+---
+
+### Hobo U20L (HOBOware-exported `.csv`)
+The HOBO U20L stores **absolute** pressure (water + atmosphere) in kPa:
+
+$$P_{hydro}\,(\text{kPa}) = P_{abs} - P_{atm}$$
+
+$$H\,(\text{m}) = \frac{P_{hydro}}{9.80665} + h_{sensor}$$
+
+($\rho_{water} = 1000\,\text{kg/m}^3$, $g = 9.80665\,\text{m/s}^2$)
+
+---
+
+### Why can't binary `.hobo` files be read directly?
+Onset's `.hobo` binary format uses a proprietary encoding (OpenDAL) that is
+not publicly documented. The HOBOware desktop software contains the decoder.
+Export via **HOBOware → Export → Text/CSV** to obtain a standard CSV.
+
+---
+
+### Sensor Inventory
+| Watershed | OBS Sensors | Hobo Sites |
+|-----------|-------------|------------|
+| Hanumante | 303, 469, 470 | Gonsal, Maheshwari, RadheRadhe |
+| Nakkhu    | 300, 301, 304, 455, 467 | — |
+        """
+    )
