@@ -454,7 +454,7 @@ def wl_timeseries_fig(
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Water Level Analysis — S4W-Nepal",
+    page_title="Water Level Conversion — S4W-Nepal",
     page_icon="💧",
     layout="wide",
 )
