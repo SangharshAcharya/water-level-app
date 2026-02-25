@@ -475,38 +475,10 @@ Mixed uploads are fine — formats are detected automatically.
     )
 
     st.divider()
-    st.subheader("🌐 Share this app")
-    st.markdown(
-        """
-**Option A — Local network (same building)**
-
-Stop the app, then run:
-```
-streamlit run water_level_app.py --server.address 0.0.0.0 --server.port 8502
-```
-Anyone on the **same Wi-Fi / LAN** can open:
-`http://<your-PC-IP>:8502`
-
-Find your IP with `ipconfig` → look for *IPv4 Address*.
-
----
-
-**Option B — Internet (different Wi-Fi)**
-
-1. Push `water_level_app.py` to a **GitHub** repository  
-2. Go to [share.streamlit.io](https://share.streamlit.io) → *New app*  
-3. Connect the repo — Streamlit Community Cloud hosts it **free**  
-4. Share **https://water-level-s4w-nepal.streamlit.app** with anyone
-
-Add a `requirements.txt` next to the app file:
-```
-streamlit
-plotly
-pandas
-numpy
-openpyxl
-```
-        """
+    st.link_button(
+        "🌐 Visit S4W-Nepal",
+        "https://s4w-nepal.smartphones4water.org/",
+        use_container_width=True,
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
