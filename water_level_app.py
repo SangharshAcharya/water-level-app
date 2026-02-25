@@ -141,6 +141,16 @@ def detect_obs_firmware(file_bytes: bytes) -> tuple[str, str | None]:
     return firmware, fw_date_str
 
 
+def extract_obs_sn(file_bytes: bytes) -> str:
+    """
+    Parse 'OpenOBS SN:XXX' from the file header comment block.
+    Returns the SN string, or 'Unknown' if not found.
+    """
+    text = file_bytes.decode("utf-8", errors="replace")
+    m = re.search(r"OpenOBS\s+SN\s*:\s*(\w+)", text, re.IGNORECASE)
+    return m.group(1) if m else "Unknown"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OBS parser & water-level formula
 # ─────────────────────────────────────────────────────────────────────────────
@@ -571,10 +581,15 @@ hobo_names = [n for n, fmt in file_format.items() if fmt == "hobo_csv"]
 bin_names  = [n for n, fmt in file_format.items() if fmt == "hobo_binary"]
 unk_names  = [n for n, fmt in file_format.items() if fmt == "unknown"]
 
-# Detect OBS firmware version for each OBS file
+# Detect OBS firmware version and serial number for each OBS file
 file_obs_firmware: dict[str, tuple[str, str | None]] = {}
+file_sn: dict[str, str] = {}
 for _n in obs_names:
     file_obs_firmware[_n] = detect_obs_firmware(file_cache[_n])
+    file_sn[_n] = extract_obs_sn(file_cache[_n])
+# For Hobo files use the stem as identifier
+for _n in hobo_names:
+    file_sn[_n] = _n.rsplit(".", 1)[0]
 
 # Detection summary
 fmt_labels = {
@@ -586,8 +601,9 @@ fmt_labels = {
 det_rows: list[dict] = []
 for _n in [u.name for u in uploaded]:
     _row: dict = {
-        "File":        _n,
-        "Detected as": fmt_labels.get(file_format[_n], file_format[_n]),
+        "File":         _n,
+        "Detected as":  fmt_labels.get(file_format[_n], file_format[_n]),
+        "Sensor SN":    file_sn.get(_n, "—"),
         "OBS Firmware": "—",
     }
     if file_format[_n] == "obs_txt":
@@ -644,12 +660,47 @@ if bin_names:
             )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sensor height editor
+# Station name mapping
 # ─────────────────────────────────────────────────────────────────────────────
 parseable = obs_names + hobo_names
 if not parseable:
     st.info("No parseable files yet. Upload OBS `.txt` or HOBOware CSV files.")
     st.stop()
+
+st.markdown("---")
+st.subheader("📍 Station Name Assignment")
+st.caption(
+    "The app detected the sensor serial numbers below. "
+    "Assign a station / location name to each SN — the plots and downloads will be grouped by station name. "
+    "Multiple offload files from the same sensor automatically share the same station."
+)
+
+unique_sns = sorted(set(file_sn.values()))
+_sn_key    = tuple(unique_sns)
+if st.session_state.get("_sn_key") != _sn_key:
+    st.session_state["_sn_key"]          = _sn_key
+    st.session_state["sn_station_map"]   = {sn: sn for sn in unique_sns}
+
+sn_map_df = pd.DataFrame({
+    "Sensor_SN":    unique_sns,
+    "Station_name": [st.session_state["sn_station_map"].get(sn, sn) for sn in unique_sns],
+})
+edited_sn = st.data_editor(
+    sn_map_df,
+    column_config={
+        "Sensor_SN":    st.column_config.TextColumn("Sensor SN",    disabled=True),
+        "Station_name": st.column_config.TextColumn(
+            "Station Name",
+            help="Type the location name for this sensor, e.g. 'Kasan', 'Nakkhudole'. "
+                 "Files with the same SN are automatically grouped under this name.",
+        ),
+    },
+    hide_index=True,
+    use_container_width=True,
+    key="sn_station_editor",
+)
+st.session_state["sn_station_map"] = dict(zip(edited_sn["Sensor_SN"], edited_sn["Station_name"]))
+sn_station_map = st.session_state["sn_station_map"]
 
 st.markdown("---")
 st.subheader("📏 Sensor Settings")
@@ -681,6 +732,7 @@ if st.session_state.get("_sensor_files_key") != _file_key:
     st.session_state["_sensor_files_key"]  = _file_key
     st.session_state["sensor_heights"]     = dict(zip(parseable, default_h_list))
     st.session_state["obs_fw_overrides"]   = dict(zip(parseable, default_fw_list))
+    st.session_state.pop("results", None)   # reset results when files change
 
 current_heights  = st.session_state["sensor_heights"]
 fw_overrides     = st.session_state["obs_fw_overrides"]
@@ -704,6 +756,8 @@ with bc2:
 # ── Editable settings table ────────────────────────────────────────────────────
 height_df = pd.DataFrame({
     "File":            parseable,
+    "Sensor_SN":       [file_sn.get(n, "—") for n in parseable],
+    "Station":         [sn_station_map.get(file_sn.get(n, "—"), file_sn.get(n, "—")) for n in parseable],
     "Type":            [
         "OBS" if file_format[n] == "obs_txt" else "Hobo CSV"
         for n in parseable
@@ -714,8 +768,10 @@ height_df = pd.DataFrame({
 edited = st.data_editor(
     height_df,
     column_config={
-        "File": st.column_config.TextColumn("File", disabled=True),
-        "Type": st.column_config.TextColumn("Type", disabled=True),
+        "File":       st.column_config.TextColumn("File",       disabled=True),
+        "Sensor_SN":  st.column_config.TextColumn("Sensor SN",  disabled=True),
+        "Station":    st.column_config.TextColumn("Station",    disabled=True),
+        "Type":       st.column_config.TextColumn("Type",       disabled=True),
         "Sensor_height_m": st.column_config.NumberColumn(
             "Sensor Height (m)", min_value=0.0, max_value=5.0,
             step=0.005, format="%.3f",
@@ -723,7 +779,7 @@ edited = st.data_editor(
         "OBS_firmware": st.column_config.SelectboxColumn(
             "OBS Firmware",
             options=["new", "old", "—"],
-            help="'new' ÷10 (post July 2025, ~8 600 units).  'old' ÷100 (pre July 2025, ~85 000 Pa units).  '—' for Hobo files.",
+            help="'new' ÷10 (post July 2025).  'old' ÷100 (pre July 2025).  '—' for Hobo.",
         ),
     },
     hide_index=True,
@@ -749,13 +805,16 @@ if st.button("▶ Process All Files", type="primary"):
         fmt = file_format[fname]
         fb  = file_cache[fname]
 
+        sn      = file_sn.get(fname, "Unknown")
+        station = sn_station_map.get(sn, sn)
+
         if fmt == "obs_txt":
             raw, err = parse_obs_txt(fb, fname)
             if err:
                 st.error(f"**{fname}**: {err}")
                 continue
             fw_val = file_fw_overrides.get(fname, "new")
-            if fw_val not in ("old", "new"):          # e.g. '—' shouldn't happen for OBS
+            if fw_val not in ("old", "new"):
                 fw_val = file_obs_firmware.get(fname, ("new",))[0]
             processed = calc_water_level_obs(raw, sh, baro_df, default_atm_kpa, firmware=fw_val)
         else:
@@ -766,9 +825,13 @@ if st.button("▶ Process All Files", type="primary"):
             processed = calc_water_level_hobo(raw, sh, baro_df, default_atm_kpa)
 
         processed["Offload_file"] = fname
+        processed["Station"]      = station
+        processed["Sensor_SN"]    = sn
         raw["Offload_file"]       = fname
+        raw["Station"]            = station
+        raw["Sensor_SN"]          = sn
         results_list.append({
-            "name": fname, "fmt": fmt,
+            "name": fname, "fmt": fmt, "station": station, "sn": sn,
             "raw": raw, "processed": processed,
         })
 
@@ -790,15 +853,15 @@ if "results" not in st.session_state:
 
 results_list: list[dict] = st.session_state["results"]
 
-all_proc  = pd.concat([r["processed"] for r in results_list], ignore_index=True).sort_values("Date")
-raw_obs   = pd.concat(
+all_proc = pd.concat([r["processed"] for r in results_list], ignore_index=True).sort_values("Date")
+raw_obs  = pd.concat(
     [r["raw"] for r in results_list if r["fmt"] == "obs_txt"], ignore_index=True
 ) if any(r["fmt"] == "obs_txt" for r in results_list) else pd.DataFrame()
-raw_hobo  = pd.concat(
+raw_hobo = pd.concat(
     [r["raw"] for r in results_list if r["fmt"] == "hobo_csv"], ignore_index=True
 ) if any(r["fmt"] == "hobo_csv" for r in results_list) else pd.DataFrame()
 
-# ── Date-range filter ─────────────────────────────────────────────────────────
+# ── Global date-range filter ─────────────────────────────────────────────────
 st.markdown("---")
 fc1, fc2 = st.columns(2)
 with fc1:
@@ -821,87 +884,38 @@ if view.empty:
     st.warning("No data in selected date range.")
     st.stop()
 
-date_tag = f"{start_d}_{end_d}"
+date_tag     = f"{start_d}_{end_d}"
+stations_all = sorted(view["Station"].unique().tolist()) if "Station" in view.columns else ["All"]
 
-# ── Metric cards ─────────────────────────────────────────────────────────────
+# ── Global overview metrics ──────────────────────────────────────────────────
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Records (filtered)", f"{len(view):,}")
-m2.metric("Max WL",  f"{view['Water_level_m'].max():.3f} m")
-m3.metric("Min WL",  f"{view['Water_level_m'].min():.3f} m")
-m4.metric("Mean WL", f"{view['Water_level_m'].mean():.3f} m")
-m5.metric("Files",   str(len(results_list)))
+m2.metric("Max WL",   f"{view['Water_level_m'].max():.3f} m")
+m3.metric("Min WL",   f"{view['Water_level_m'].min():.3f} m")
+m4.metric("Mean WL",  f"{view['Water_level_m'].mean():.3f} m")
+m5.metric("Stations", str(len(stations_all)))
 
-# ── Combined water-level plot ─────────────────────────────────────────────────
-st.markdown("### 📈 Water Level Timeseries — All Files")
-st.plotly_chart(wl_timeseries_fig(view, "Offload_file", file_heights), use_container_width=True)
-
-# ── OBS sub-plots ─────────────────────────────────────────────────────────────
-obs_view = view[view["Offload_file"].isin(obs_names)].copy()
-if not obs_view.empty:
-    with st.expander("📊 OBS — Pressure / Backscatter / Temperature sub-panels", expanded=False):
-        uniq = obs_view["Offload_file"].unique().tolist()
-        fig_obs = make_subplots(
-            rows=4, cols=1, shared_xaxes=True,
-            subplot_titles=("Water Level (m)", "Raw Pressure", "Backscatter", "Water Temp (raw)"),
-            vertical_spacing=0.06,
-        )
-        for i, fn in enumerate(uniq):
-            seg = obs_view[obs_view["Offload_file"] == fn]
-            c   = PALETTE[i % len(PALETTE)]
-            for row, ycol in enumerate(
-                ["Water_level_m", "Pressure", "Backscatter", "Water_temp"], 1
-            ):
-                if ycol in seg.columns:
-                    fig_obs.add_trace(
-                        go.Scatter(
-                            x=seg["Date"], y=seg[ycol], mode="lines",
-                            name=fn, line=dict(color=c, width=1.2),
-                            showlegend=(row == 1),
-                        ),
-                        row=row, col=1,
-                    )
-        for row, lbl in enumerate(
-            ["WL (m)", "Pressure (raw)", "Backscatter", "Temp (raw)"], 1
-        ):
-            fig_obs.update_yaxes(title_text=lbl, row=row, col=1)
-        fig_obs.update_xaxes(title_text="Date / Time", row=4, col=1)
-        fig_obs.update_layout(
-            height=900, template="plotly_white",
-            hovermode="x unified", margin=dict(t=40, b=40),
-        )
-        st.plotly_chart(fig_obs, use_container_width=True)
-
-# ── Hobo sub-plots ────────────────────────────────────────────────────────────
-hobo_view = view[view["Offload_file"].isin(hobo_names)].copy()
-if not hobo_view.empty:
-    with st.expander("📊 Hobo — Absolute Pressure / Temperature sub-panels", expanded=False):
-        uniq_h = hobo_view["Offload_file"].unique().tolist()
-        fig_hob = make_subplots(
-            rows=3, cols=1, shared_xaxes=True,
-            subplot_titles=("Water Level (m)", "Absolute Pressure (kPa)", "Water Temp (°C)"),
-            vertical_spacing=0.07,
-        )
-        for i, fn in enumerate(uniq_h):
-            seg = hobo_view[hobo_view["Offload_file"] == fn]
-            c   = PALETTE[(len(obs_names) + i) % len(PALETTE)]
-            for row, ycol in enumerate(["Water_level_m", "Abs_Pres_kPa", "Temp_C"], 1):
-                if ycol in seg.columns:
-                    fig_hob.add_trace(
-                        go.Scatter(
-                            x=seg["Date"], y=seg[ycol], mode="lines",
-                            name=fn, line=dict(color=c, width=1.2),
-                            showlegend=(row == 1),
-                        ),
-                        row=row, col=1,
-                    )
-        for row, lbl in enumerate(["WL (m)", "Abs Pres (kPa)", "Temp (°C)"], 1):
-            fig_hob.update_yaxes(title_text=lbl, row=row, col=1)
-        fig_hob.update_xaxes(title_text="Date / Time", row=3, col=1)
-        fig_hob.update_layout(
-            height=720, template="plotly_white",
-            hovermode="x unified", margin=dict(t=40, b=40),
-        )
-        st.plotly_chart(fig_hob, use_container_width=True)
+# ── Overview — all stations on one plot ───────────────────────────────────────
+st.markdown("### 📈 All Stations — Overview")
+fig_all = go.Figure()
+for i, r in enumerate(results_list):
+    seg = view[view["Offload_file"] == r["name"]]
+    if seg.empty:
+        continue
+    sh = file_heights.get(r["name"], 0.10)
+    fig_all.add_trace(go.Scatter(
+        x=seg["Date"], y=seg["Water_level_m"],
+        mode="lines",
+        name=f"{r.get('station', r['name'])}  [{r['name']}]",
+        line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
+        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<extra></extra>",
+    ))
+fig_all.update_layout(
+    xaxis_title="Date / Time", yaxis_title="Water Level (m)",
+    height=420, hovermode="x unified", template="plotly_white",
+    margin=dict(t=30, b=40),
+)
+st.plotly_chart(fig_all, use_container_width=True)
 
 # ── Atmospheric pressure overlay ──────────────────────────────────────────────
 if baro_df is not None:
@@ -920,75 +934,171 @@ if baro_df is not None:
         )
         st.plotly_chart(fig_b, use_container_width=True)
 
-# ── Data table previews ───────────────────────────────────────────────────────
-with st.expander("🗃️ Processed Water-Level Table (preview)", expanded=False):
-    proc_cols = [
-        "Date", "Offload_file", "Sensor_height_m", "Atm_kPa", "Water_level_m",
-        "Pressure", "hydroP_mbar", "Ambient_light", "Backscatter", "Water_temp", "Battery",
-        "Abs_Pres_kPa", "Hydro_kPa", "Temp_C",
-    ]
-    avail = [c for c in proc_cols if c in view.columns]
-    st.dataframe(view[avail].head(500), use_container_width=True, height=320)
-
-if not raw_obs.empty:
-    with st.expander("🗃️ OBS Raw Data (preview)", expanded=False):
-        st.caption("Direct sensor output — no pressure conversion applied.")
-        st.dataframe(raw_obs.head(500), use_container_width=True, height=300)
-
-if not raw_hobo.empty:
-    with st.expander("🗃️ Hobo Raw Data (preview — HOBOware CSV columns)", expanded=False):
-        st.caption("Data exactly as exported from HOBOware — no conversion applied.")
-        st.dataframe(raw_hobo.head(500), use_container_width=True, height=300)
+st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Downloads
+# Per-station results (one tab per station)
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.subheader("💾 Downloads")
+st.subheader("📍 Per-Station Results")
 
-# ── Combined processed (date-filtered) ───────────────────────────────────────
-st.markdown("#### Combined — Processed Water Level (date-filtered)")
-download_pair("All files · Processed WL", view, f"WaterLevel_all_{date_tag}", "all_proc")
+# Group result dicts by station name
+station_to_results: dict[str, list[dict]] = {}
+for _r in results_list:
+    _st = _r.get("station", _r["name"])
+    station_to_results.setdefault(_st, []).append(_r)
 
-st.markdown("---")
+station_list = sorted(station_to_results.keys())
+tab_containers = st.tabs(station_list) if len(station_list) > 1 else [st.container()]
 
-# ── Raw data — combined ────────────────────────────────────────────────────────
-if not raw_obs.empty:
-    st.markdown("#### OBS Raw Data — All OBS Files")
-    download_pair("OBS Raw", raw_obs, "OBS_raw_all", "obs_raw_combined")
+for tab_c, station in zip(tab_containers, station_list):
+    with tab_c:
+        st_results = station_to_results[station]
+        st_files   = [r["name"] for r in st_results]
+        st_fmt     = st_results[0]["fmt"]
 
-if not raw_hobo.empty:
-    st.markdown("#### Hobo Raw Data — All Hobo Files (HOBOware CSV)")
-    st.caption(
-        "This is the raw HOBOware export data (absolute pressure in kPa) "
-        "as parsed from the uploaded CSV, before any water-level conversion."
-    )
-    download_pair("Hobo Raw", raw_hobo, "Hobo_raw_all", "hobo_raw_combined")
+        st_proc = pd.concat([r["processed"] for r in st_results], ignore_index=True).sort_values("Date")
+        st_raw  = pd.concat([r["raw"]       for r in st_results], ignore_index=True).sort_values("Date")
+        st_filt = st_proc[
+            (st_proc["Date"].dt.date >= start_d) &
+            (st_proc["Date"].dt.date <= end_d)
+        ].copy()
 
-st.markdown("---")
+        if st_filt.empty:
+            st.info(f"No data for **{station}** in the selected date range.")
+            continue
 
-# ── Per-file downloads ────────────────────────────────────────────────────────
-st.markdown("#### Per-File Downloads")
-tabs = st.tabs([r["name"] for r in results_list])
-for tab, r in zip(tabs, results_list):
-    with tab:
-        stem      = r["name"].rsplit(".", 1)[0]
-        fmt_label = "OBS" if r["fmt"] == "obs_txt" else "Hobo"
-        st.markdown(f"**{fmt_label} · {r['name']}**")
-
-        st.markdown("*Raw sensor data (no water-level conversion)*")
-        download_pair("Raw", r["raw"], f"{stem}_raw", f"raw_{stem}")
-
-        proc_filt = r["processed"][
-            (r["processed"]["Date"].dt.date >= start_d) &
-            (r["processed"]["Date"].dt.date <= end_d)
-        ]
-        st.markdown(f"*Processed water level ({start_d} → {end_d})*")
-        download_pair(
-            "Processed WL", proc_filt,
-            f"{stem}_WaterLevel_{date_tag}",
-            f"proc_{stem}",
+        sn_display = st_proc["Sensor_SN"].iloc[0] if "Sensor_SN" in st_proc.columns else "—"
+        st.markdown(
+            f"**Station:** `{station}`  ·  "
+            f"**Sensor SN:** `{sn_display}`  ·  "
+            f"**Offload files:** {len(st_files)}"
         )
+
+        # Station metrics
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("Records", f"{len(st_filt):,}")
+        sm2.metric("Max WL",  f"{st_filt['Water_level_m'].max():.3f} m")
+        sm3.metric("Min WL",  f"{st_filt['Water_level_m'].min():.3f} m")
+        sm4.metric("Mean WL", f"{st_filt['Water_level_m'].mean():.3f} m")
+
+        # Water level timeseries — all offloads on one plot, colored per offload file
+        fig_wl = go.Figure()
+        for i, fn in enumerate(st_files):
+            seg = st_filt[st_filt["Offload_file"] == fn]
+            if seg.empty:
+                continue
+            sh = file_heights.get(fn, 0.10)
+            fig_wl.add_trace(go.Scatter(
+                x=seg["Date"], y=seg["Water_level_m"],
+                mode="lines",
+                name=f"{fn}  (h={sh:.3f} m)",
+                line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
+                hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<extra></extra>",
+            ))
+        fig_wl.update_layout(
+            title=f"Water Level — {station}",
+            xaxis_title="Date / Time", yaxis_title="Water Level (m)",
+            height=420, hovermode="x unified", template="plotly_white",
+            margin=dict(t=50, b=40),
+        )
+        st.plotly_chart(fig_wl, use_container_width=True)
+
+        # Sub-panels (OBS or Hobo)
+        if st_fmt == "obs_txt":
+            with st.expander(f"📊 {station} — Pressure / Backscatter / Temperature", expanded=False):
+                fig_sub = make_subplots(
+                    rows=4, cols=1, shared_xaxes=True,
+                    subplot_titles=("Water Level (m)", "Raw Pressure", "Backscatter", "Water Temp (raw)"),
+                    vertical_spacing=0.06,
+                )
+                for i, fn in enumerate(st_files):
+                    seg = st_filt[st_filt["Offload_file"] == fn]
+                    if seg.empty:
+                        continue
+                    c = PALETTE[i % len(PALETTE)]
+                    for row, ycol in enumerate(["Water_level_m", "Pressure", "Backscatter", "Water_temp"], 1):
+                        if ycol in seg.columns:
+                            fig_sub.add_trace(go.Scatter(
+                                x=seg["Date"], y=seg[ycol], mode="lines",
+                                name=fn, line=dict(color=c, width=1.2),
+                                showlegend=(row == 1),
+                            ), row=row, col=1)
+                for row, lbl in enumerate(["WL (m)", "Pressure (raw)", "Backscatter", "Temp (raw)"], 1):
+                    fig_sub.update_yaxes(title_text=lbl, row=row, col=1)
+                fig_sub.update_xaxes(title_text="Date / Time", row=4, col=1)
+                fig_sub.update_layout(height=900, template="plotly_white",
+                                      hovermode="x unified", margin=dict(t=40, b=40))
+                st.plotly_chart(fig_sub, use_container_width=True)
+
+        elif st_fmt == "hobo_csv":
+            with st.expander(f"📊 {station} — Absolute Pressure / Temperature", expanded=False):
+                fig_sub = make_subplots(
+                    rows=3, cols=1, shared_xaxes=True,
+                    subplot_titles=("Water Level (m)", "Absolute Pressure (kPa)", "Water Temp (°C)"),
+                    vertical_spacing=0.07,
+                )
+                for i, fn in enumerate(st_files):
+                    seg = st_filt[st_filt["Offload_file"] == fn]
+                    if seg.empty:
+                        continue
+                    c = PALETTE[i % len(PALETTE)]
+                    for row, ycol in enumerate(["Water_level_m", "Abs_Pres_kPa", "Temp_C"], 1):
+                        if ycol in seg.columns:
+                            fig_sub.add_trace(go.Scatter(
+                                x=seg["Date"], y=seg[ycol], mode="lines",
+                                name=fn, line=dict(color=c, width=1.2),
+                                showlegend=(row == 1),
+                            ), row=row, col=1)
+                for row, lbl in enumerate(["WL (m)", "Abs Pres (kPa)", "Temp (°C)"], 1):
+                    fig_sub.update_yaxes(title_text=lbl, row=row, col=1)
+                fig_sub.update_xaxes(title_text="Date / Time", row=3, col=1)
+                fig_sub.update_layout(height=720, template="plotly_white",
+                                      hovermode="x unified", margin=dict(t=40, b=40))
+                st.plotly_chart(fig_sub, use_container_width=True)
+
+        # Data previews
+        with st.expander(f"🗃️ {station} — Processed Data (preview)", expanded=False):
+            proc_cols = [
+                "Date", "Station", "Sensor_SN", "Offload_file",
+                "Sensor_height_m", "Atm_kPa", "Water_level_m",
+                "Pressure", "hydroP_mbar", "Ambient_light", "Backscatter", "Water_temp", "Battery",
+                "Abs_Pres_kPa", "Hydro_kPa", "Temp_C",
+            ]
+            avail = [c for c in proc_cols if c in st_filt.columns]
+            st.dataframe(st_filt[avail].head(500), use_container_width=True, height=280)
+
+        with st.expander(f"🗃️ {station} — Raw Data (preview)", expanded=False):
+            st.caption("Direct sensor output — no water-level conversion.")
+            st.dataframe(st_raw.head(500), use_container_width=True, height=260)
+
+        # Per-station downloads
+        st.markdown(f"**⬇ Downloads — {station}**")
+        _safe = station.replace(" ", "_")
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            download_pair(
+                "Raw (all offloads)", st_raw,
+                f"{_safe}_raw", f"st_raw_{_safe}"
+            )
+        with dl2:
+            download_pair(
+                "Processed WL", st_filt,
+                f"{_safe}_WaterLevel_{date_tag}", f"st_proc_{_safe}"
+            )
+        st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combined downloads — all stations
+# ─────────────────────────────────────────────────────────────────────────────
+st.subheader("💾 Combined Downloads — All Stations")
+download_pair("All Stations · Processed WL", view, f"WaterLevel_all_{date_tag}", "all_proc")
+st.markdown("---")
+if not raw_obs.empty:
+    st.markdown("#### OBS Raw — All Stations")
+    download_pair("OBS Raw", raw_obs, "OBS_raw_all", "obs_raw_combined")
+if not raw_hobo.empty:
+    st.markdown("#### Hobo Raw — All Stations")
+    download_pair("Hobo Raw", raw_hobo, "Hobo_raw_all", "hobo_raw_combined")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # About
