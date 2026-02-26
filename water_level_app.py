@@ -35,7 +35,7 @@ OBS_SENSOR_HEIGHT_DEFAULTS = {
     "303": 0.08, "469": 0.10, "470": 0.10,
     "300": 0.10, "301": 0.10, "304": 0.10, "455": 0.19, "467": 0.10,
 }
-# Hobo sensors sit on the river bed — height offset is always 0.0 m.
+# Hobo sensors: default calibration offset is 0.0 m — user can adjust to correct systematic bias.
 HOBO_SENSOR_HEIGHT_DEFAULT = 0.0
 
 PALETTE = [
@@ -273,13 +273,81 @@ def parse_hobo_csv(
             "Make sure you exported a HOBO U20L Water Level CSV from HOBOware."
         )
 
-    df["Date"]        = pd.to_datetime(df[date_col], errors="coerce")
+    # ── Parse raw pressure values first, then detect unit ──────────────────
+    df["Date"] = pd.to_datetime(df[date_col], errors="coerce")
     df.dropna(subset=["Date"], inplace=True)
-    df["Abs_Pres_kPa"] = pd.to_numeric(df[pres_col], errors="coerce")
+    _raw_pres = pd.to_numeric(df[pres_col], errors="coerce")
+    _median_val = float(_raw_pres.dropna().median()) if not _raw_pres.dropna().empty else 0.0
+
+    # ── Step 1: try to read unit from column name ───────────────────────────
+    #    HOBOware encodes unit as: "Abs Pres, kPa (LGR S/N: …)"
+    #                          or: "Abs Pres, mbar (LGR S/N: …)"  etc.
+    _unit_from_name: str | None = None
+    _unit_match = re.search(
+        r"(?:Abs.?Pres|Pressure)[^,]*,\s*(kPa|psi|mbar|hPa|bar|Pa|cmH2O|inH2O)",
+        pres_col, re.IGNORECASE,
+    )
+    if not _unit_match:
+        # also handle parenthesis format: "Abs Pres (kPa)"
+        _unit_match = re.search(
+            r"(?:Abs.?Pres|Pressure)[^(]*\(\s*(kPa|psi|mbar|hPa|bar|Pa|cmH2O|inH2O)\s*\)",
+            pres_col, re.IGNORECASE,
+        )
+    if _unit_match:
+        _unit_from_name = _unit_match.group(1).lower()
+
+    # ── Step 2: numeric-range heuristic (primary trust source) ─────────────
+    #    At Kathmandu Valley (~1400 m elevation):
+    #      kPa  → absolute pressure ≈ 84–200 kPa
+    #              (upper bound extended to 200 to handle deeply-deployed or
+    #               calibration-drifted sensors that read up to ~10 m head above atm)
+    #      mbar → absolute pressure ≈ 840–1150 mbar
+    #      hPa  → same numeric range as mbar
+    #      psi  → absolute pressure ≈ 12–17 psi
+    #      Pa   → absolute pressure ≈ 84 000–115 000 Pa
+    if 60.0 <= _median_val <= 200.0:
+        _unit_from_range = "kpa"
+    elif 600.0 <= _median_val <= 1300.0:
+        _unit_from_range = "mbar"   # mbar / hPa identical numerically
+    elif 9.0 <= _median_val <= 20.0:
+        _unit_from_range = "psi"
+    elif 60_000.0 <= _median_val <= 130_000.0:
+        _unit_from_range = "pa"
+    else:
+        _unit_from_range = None   # can't determine from range alone
+
+    # ── Step 3: reconcile ───────────────────────────────────────────────────
+    #    If both agree → use that.  If only one known → use it.
+    #    If they disagree → trust the numeric range (more reliable than
+    #    column-name parsing differences across HOBOware versions).
+    _UNIT_TO_KPA = {
+        "kpa":   1.0,
+        "mbar":  0.1,       # 1 mbar = 0.1 kPa
+        "hpa":   0.1,       # 1 hPa  = 0.1 kPa (same as mbar)
+        "pa":    0.001,     # 1 Pa   = 0.001 kPa
+        "psi":   6.89476,   # 1 psi  = 6.89476 kPa
+        "bar":   100.0,
+        "cmh2o": 0.0980665,
+        "inh2o": 0.249089,
+    }
+    if _unit_from_range is not None:
+        _pres_unit = _unit_from_range          # numeric range is most reliable
+    elif _unit_from_name is not None:
+        _pres_unit = _unit_from_name           # fall back to column name
+    else:
+        _pres_unit = "kpa"                     # last resort default
+    _conv = _UNIT_TO_KPA.get(_pres_unit, 1.0)
+
+    df["Abs_Pres_kPa"] = _raw_pres * _conv   # always stored as kPa internally
+    df["_pres_unit"]   = _pres_unit           # keep for diagnostics
+    df["_pres_conv"]   = _conv
+    df["_unit_from_name"]  = _unit_from_name  if _unit_from_name  else "?"
+    df["_unit_from_range"] = _unit_from_range if _unit_from_range else "?"
     df["Temp_C"]       = pd.to_numeric(df[temp_col], errors="coerce") if temp_col else np.nan
     df["Source_file"]  = filename
 
-    result = df[["Date", "Abs_Pres_kPa", "Temp_C", "Source_file"]].dropna(subset=["Abs_Pres_kPa"])
+    result = df[["Date", "Abs_Pres_kPa", "_pres_unit", "_pres_conv",
+                 "_unit_from_name", "_unit_from_range", "Temp_C", "Source_file"]].dropna(subset=["Abs_Pres_kPa"])
     return result.sort_values("Date").reset_index(drop=True), None
 
 
@@ -643,9 +711,10 @@ sn_station_map = st.session_state["sn_station_map"]
 st.markdown("---")
 st.subheader("📏 Sensor Settings")
 st.caption(
-    "Set the sensor height (distance from sensor face to channel bed, in metres). "
-    "Use **Set OBS sensor heights to** to batch-update all OBS files at once, "
-    "**Set height by Serial Number** to update all files of a specific sensor at once, "
+    "Set the sensor height / calibration offset in metres. "
+    "**OBS**: physical height from sensor face to channel bed. "
+    "**Hobo**: WL calibration offset — use a negative value (e.g. −8) to correct a systematic over-reading. "
+    "Use the batch setters to apply a value to all files at once, "
     "or edit individual rows in the table below. "
     "The Firmware column is auto-detected from the raw pressure value — override it here if needed."
 )
@@ -658,7 +727,7 @@ for fn in parseable:
         sid = next((k for k in OBS_SENSOR_HEIGHT_DEFAULTS if k in stem), None)
         default_h_list.append(OBS_SENSOR_HEIGHT_DEFAULTS.get(sid, 0.10))
     else:
-        # Hobo sensors are fixed on the river bed — no height correction needed
+        # Hobo sensors: default offset is 0.0 m; user can adjust to correct bias
         default_h_list.append(HOBO_SENSOR_HEIGHT_DEFAULT)
 
 default_fw_list: list[str] = [
@@ -677,7 +746,7 @@ if st.session_state.get("_sensor_files_key") != _file_key:
 current_heights  = st.session_state["sensor_heights"]
 fw_overrides     = st.session_state["obs_fw_overrides"]
 
-# ── Batch height setter ────────────────────────────────────────────────────────
+# ── Batch height / offset setters ───────────────────────────────────────────────
 bc1, bc2, _bc3 = st.columns([2, 1, 3])
 with bc1:
     batch_h = st.number_input(
@@ -685,8 +754,7 @@ with bc1:
         min_value=0.0, max_value=5.0,
         value=0.10, step=0.005, format="%.3f",
         key="batch_height_input",
-        help="Applies the same height to every **OBS** file at once. "
-             "Hobo sensors are fixed at 0.000 m (sensor sits on the river bed).",
+        help="Applies the same height to every **OBS** file at once.",
     )
 with bc2:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -697,6 +765,35 @@ with bc2:
                 updated[fn] = batch_h
         st.session_state["sensor_heights"] = updated
         st.rerun()
+
+hobo_files = [fn for fn in parseable if file_format[fn] == "hobo_csv"]
+if hobo_files:
+    hb1, hb2, _hb3 = st.columns([2, 1, 3])
+    with hb1:
+        batch_hobo_offset = st.number_input(
+            "Set Hobo WL offset to (m):",
+            min_value=-50.0, max_value=50.0,
+            value=0.0, step=0.1, format="%.3f",
+            key="batch_hobo_offset_input",
+            help="Applies the same calibration offset to every **Hobo** file at once. "
+                 "Use a **negative** value (e.g. −8.5) when the Hobo reads much higher than "
+                 "nearby sensors — this corrects systematic pressure bias.",
+        )
+    with hb2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("✅ Apply to Hobo", key="apply_batch_hobo_offset"):
+            updated = dict(st.session_state["sensor_heights"])
+            for fn in hobo_files:
+                updated[fn] = batch_hobo_offset
+            st.session_state["sensor_heights"] = updated
+            st.rerun()
+    with _hb3:
+        st.markdown(
+            "<br><small style='color:grey'>Applies to: " +
+            ", ".join(hobo_files) +
+            "</small>",
+            unsafe_allow_html=True,
+        )
 
 # ── Per-SN height setter ───────────────────────────────────────────────────────
 obs_files = [fn for fn in parseable if file_format[fn] == "obs_txt"]
@@ -745,8 +842,7 @@ height_df = pd.DataFrame({
         for n in parseable
     ],
     "Sensor_height_m": [
-        HOBO_SENSOR_HEIGHT_DEFAULT if file_format[fn] == "hobo_csv"
-        else current_heights.get(fn, h)
+        current_heights.get(fn, h)
         for fn, h in zip(parseable, default_h_list)
     ],
     "OBS_firmware":    [fw_overrides.get(fn, fw) for fn, fw in zip(parseable, default_fw_list)],
@@ -759,10 +855,11 @@ edited = st.data_editor(
         "Station":    st.column_config.TextColumn("Station",    disabled=True),
         "Type":       st.column_config.TextColumn("Type",       disabled=True),
         "Sensor_height_m": st.column_config.NumberColumn(
-            "Sensor Height (m)", min_value=0.0, max_value=5.0,
+            "Height / Offset (m)", min_value=-50.0, max_value=50.0,
             step=0.005, format="%.3f",
-            help="OBS only — edit the height above bed.  Hobo sensors sit on the bed and are "
-                 "always locked to 0.000 m (any edits are ignored).",
+            help="**OBS**: physical sensor height above channel bed (≥ 0). "
+                 "**Hobo**: calibration offset — set negative (e.g. −8.5) to correct "
+                 "systematic over-reading caused by pressure bias.",
         ),
         "OBS_firmware": st.column_config.SelectboxColumn(
             "OBS Firmware",
@@ -774,9 +871,9 @@ edited = st.data_editor(
     use_container_width=True,
     key="height_editor",
 )
-# Persist edits back to session state; force Hobo heights to 0.0 regardless of user input
+# Persist edits back to session state (Hobo offsets are now user-editable)
 st.session_state["sensor_heights"] = {
-    fn: (HOBO_SENSOR_HEIGHT_DEFAULT if file_format[fn] == "hobo_csv" else h)
+    fn: h
     for fn, h in zip(edited["File"], edited["Sensor_height_m"])
 }
 st.session_state["obs_fw_overrides"] = dict(zip(edited["File"], edited["OBS_firmware"]))
@@ -819,6 +916,49 @@ if st.button("▶ Process All Files", type="primary"):
             if err:
                 st.error(f"**{fname}**: {err}")
                 continue
+            # ── Unit diagnostics ──────────────────────────────────────────
+            _unit        = raw["_pres_unit"].iloc[0]        if "_pres_unit"        in raw.columns else "kpa"
+            _conv        = float(raw["_pres_conv"].iloc[0]) if "_pres_conv"        in raw.columns else 1.0
+            _name_unit   = raw["_unit_from_name"].iloc[0]   if "_unit_from_name"   in raw.columns else "?"
+            _range_unit  = raw["_unit_from_range"].iloc[0]  if "_unit_from_range"  in raw.columns else "?"
+            _raw_min = (raw["Abs_Pres_kPa"] / _conv).min()
+            _raw_max = (raw["Abs_Pres_kPa"] / _conv).max()
+            _kpa_min = raw["Abs_Pres_kPa"].min()
+            _kpa_max = raw["Abs_Pres_kPa"].max()
+            _match_icon = "✅" if _name_unit == _range_unit else "⚠️"
+            if _unit != "kpa":
+                st.warning(
+                    f"⚠️ **{fname}**: Hobo pressure unit auto-detected as **{_unit.upper()}** "
+                    f"→ converted ×{_conv} to kPa.  "
+                    f"Raw: {_raw_min:.1f}–{_raw_max:.1f} {_unit.upper()}  →  "
+                    f"{_kpa_min:.2f}–{_kpa_max:.2f} kPa.  "
+                    f"[column-name: {_name_unit}, value-range: {_range_unit}]"
+                )
+            elif not (75.0 <= _kpa_min and _kpa_max <= 160.0):
+                # Check for calibration-offset sensor: high baseline, small variation
+                _wl_min_est = (_kpa_min - default_atm_kpa) / 9.80665
+                _wl_range   = (_kpa_max - _kpa_min) / 9.80665
+                if _kpa_min > 130.0 and _wl_range < 5.0:
+                    st.warning(
+                        f"⚠️ **{fname}**: Abs Pres baseline is consistently high "
+                        f"({_kpa_min:.1f}–{_kpa_max:.1f} kPa, variation only {_wl_range:.2f} m). "
+                        f"This is a **sensor calibration offset** — the zero-point is shifted by "
+                        f"~+{_kpa_min - default_atm_kpa:.1f} kPa (~{_wl_min_est:.1f} m above expected). "
+                        f"Set the **Hobo WL offset** for this file to approximately "
+                        f"**{-_wl_min_est:.1f} m** to bring the baseline to zero."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ **{fname}**: Abs Pres range {_kpa_min:.2f}–{_kpa_max:.2f} kPa "
+                        f"is outside the expected 75–160 kPa for Kathmandu. "
+                        f"[column-name: {_name_unit}, value-range: {_range_unit}] "
+                        "If values are ~10× too large, re-export from HOBOware with **kPa** units selected."
+                    )
+            else:
+                st.info(
+                    f"{_match_icon} **{fname}**: Abs Pres {_kpa_min:.2f}–{_kpa_max:.2f} kPa "
+                    f"(detected: {_unit.upper()}  |  column-name: {_name_unit}, range: {_range_unit})"
+                )
             processed = calc_water_level_hobo(raw, sh, baro_df, default_atm_kpa)
 
         processed["Offload_file"] = fname
