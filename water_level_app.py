@@ -1,5 +1,5 @@
 """
-Water Level Analysis — S4W-Nepal
+Water Level Conversion — S4W-Nepal
 =================================
 Upload raw sensor files (.txt or .csv) — the app auto-detects the format,
 applies the correct pressure → water-level formula, and delivers interactive
