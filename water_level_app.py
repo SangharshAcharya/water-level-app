@@ -1075,126 +1075,155 @@ if baro_df is not None:
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Manual Value Editor
+# Date-range Sensor Height Correction (OBS only)
 # ─────────────────────────────────────────────────────────────────────────────
-if "manual_edit_log" not in st.session_state:
-    st.session_state["manual_edit_log"] = []
+# Water level for OBS is: WL = hydro_pressure_term + sensor_height
+# Stored as:               WL = (WL - Sensor_height_m) + Sensor_height_m
+# Changing height for a range: new_WL = old_WL - old_Sensor_height_m + new_height
+# ─────────────────────────────────────────────────────────────────────────────
+if "height_correction_log" not in st.session_state:
+    st.session_state["height_correction_log"] = []
 
-with st.expander("✏️ Manual Value Editor — Override Water Level in a Date Range", expanded=False):
-    st.caption(
-        "Set all **Water_level_m** values within a chosen date/time range to a specific value. "
-        "Use this to correct spikes, flatten erroneous periods, or apply known readings. "
-        "After clicking **Apply**, adjust the range and value and apply again as many times as needed. "
-        "Edits are reflected in all plots and downloads on this page. "
-        "**Re-processing the files will reset all manual edits.**"
-    )
+_obs_results = [r for r in results_list if r["fmt"] == "obs_txt"]
 
-    _me_c1, _me_c2 = st.columns([2, 2])
-    with _me_c1:
-        _file_opts = ["— All files —"] + [r["name"] for r in results_list]
-        me_file = st.selectbox(
-            "Apply to file",
-            options=_file_opts,
-            key="me_file_select",
-            help="Choose a specific offload file, or leave as '— All files —' to apply to every file.",
-        )
-    with _me_c2:
-        me_value = st.number_input(
-            "New Water_level_m value (m)",
-            min_value=-100.0, max_value=100.0,
-            value=0.0, step=0.001, format="%.4f",
-            key="me_value_input",
-            help="All rows in the selected date/time range will have their Water_level_m set to this value.",
+if _obs_results:
+    with st.expander("📐 Date-range Sensor Height Correction — OBS files", expanded=False):
+        st.caption(
+            "Apply a different **sensor height offset** to OBS records within a specific date/time range. "
+            "Use this when the sensor was repositioned or its installation height changed partway through "
+            "a deployment. The water level is **recalculated** from the stored pressure data: "
+            "`new_WL = old_WL − old_height + new_height`. "
+            "Set the range, pick an OBS file (or all OBS files), enter the correct height, and click **Apply**. "
+            "Repeat for as many date ranges as needed. "
+            "**Re-processing the files will reset all corrections.**"
         )
 
-    _dt_min = all_proc["Date"].min()
-    _dt_max = all_proc["Date"].max()
-
-    _me_dr1, _me_dr2, _me_dr3, _me_dr4 = st.columns(4)
-    with _me_dr1:
-        me_start_date = st.date_input(
-            "Start date",
-            value=_dt_min.date(),
-            min_value=_dt_min.date(), max_value=_dt_max.date(),
-            key="me_start_date",
-        )
-    with _me_dr2:
-        me_start_time = st.time_input(
-            "Start time",
-            value=_dt_min.time(),
-            key="me_start_time",
-            step=60,
-        )
-    with _me_dr3:
-        me_end_date = st.date_input(
-            "End date",
-            value=_dt_max.date(),
-            min_value=_dt_min.date(), max_value=_dt_max.date(),
-            key="me_end_date",
-        )
-    with _me_dr4:
-        me_end_time = st.time_input(
-            "End time",
-            value=_dt_max.time(),
-            key="me_end_time",
-            step=60,
-        )
-
-    me_start_dt = pd.Timestamp(datetime.combine(me_start_date, me_start_time))
-    me_end_dt   = pd.Timestamp(datetime.combine(me_end_date,   me_end_time))
-
-    _apply_col, _preview_col = st.columns([1, 3])
-    with _apply_col:
-        _do_apply = st.button("✅ Apply Range Edit", key="apply_manual_edit", type="primary")
-    with _preview_col:
-        if me_start_dt < me_end_dt:
-            _prev_mask = (all_proc["Date"] >= me_start_dt) & (all_proc["Date"] <= me_end_dt)
-            if me_file != "— All files —":
-                _prev_mask = _prev_mask & (all_proc["Offload_file"] == me_file)
-            _preview_n = int(_prev_mask.sum())
-            st.info(f"**{_preview_n}** row(s) will be set to **{me_value:.4f} m** on Apply.")
-        else:
-            st.warning("⚠️ Start must be before end.")
-
-    if _do_apply:
-        if me_start_dt >= me_end_dt:
-            st.error("Start must be before end — no changes made.")
-        else:
-            _target_files = (
-                [r["name"] for r in results_list]
-                if me_file == "— All files —"
-                else [me_file]
+        _hc_c1, _hc_c2 = st.columns([2, 2])
+        with _hc_c1:
+            _obs_file_opts = ["— All OBS files —"] + [r["name"] for r in _obs_results]
+            hc_file = st.selectbox(
+                "Apply to OBS file",
+                options=_obs_file_opts,
+                key="hc_file_select",
+                help="Target a specific OBS offload file, or apply to all OBS files at once.",
             )
-            _new_results = []
-            _total_changed = 0
-            for _r in st.session_state["results"]:
-                if _r["name"] in _target_files:
-                    _df = _r["processed"].copy()
-                    _m  = (_df["Date"] >= me_start_dt) & (_df["Date"] <= me_end_dt)
-                    _total_changed += int(_m.sum())
-                    _df.loc[_m, "Water_level_m"] = float(me_value)
-                    _r = dict(_r)
-                    _r["processed"] = _df
-                _new_results.append(_r)
-            st.session_state["results"] = _new_results
-            st.session_state["manual_edit_log"].append({
-                "File":         me_file,
-                "Start":        str(me_start_dt),
-                "End":          str(me_end_dt),
-                "Value (m)":    round(float(me_value), 4),
-                "Rows changed": _total_changed,
-            })
-            st.rerun()
+        with _hc_c2:
+            hc_new_height = st.number_input(
+                "New sensor height (m)",
+                min_value=0.0, max_value=5.0,
+                value=0.10, step=0.005, format="%.3f",
+                key="hc_new_height_input",
+                help="Physical height of the sensor face above the channel bed for this period.",
+            )
 
-    if st.session_state["manual_edit_log"]:
-        st.markdown("**Edit history (this session):**")
-        st.dataframe(
-            pd.DataFrame(st.session_state["manual_edit_log"]),
-            use_container_width=True, hide_index=True,
-        )
-        if st.button("🗑️ Clear history log (data edits remain)", key="clear_edit_log"):
-            st.session_state["manual_edit_log"] = []
-            st.rerun()
+        _dt_min = all_proc["Date"].min()
+        _dt_max = all_proc["Date"].max()
+
+        _hc_dr1, _hc_dr2, _hc_dr3, _hc_dr4 = st.columns(4)
+        with _hc_dr1:
+            hc_start_date = st.date_input(
+                "Start date",
+                value=_dt_min.date(),
+                min_value=_dt_min.date(), max_value=_dt_max.date(),
+                key="hc_start_date",
+            )
+        with _hc_dr2:
+            hc_start_time = st.time_input(
+                "Start time",
+                value=_dt_min.time(),
+                key="hc_start_time",
+                step=60,
+            )
+        with _hc_dr3:
+            hc_end_date = st.date_input(
+                "End date",
+                value=_dt_max.date(),
+                min_value=_dt_min.date(), max_value=_dt_max.date(),
+                key="hc_end_date",
+            )
+        with _hc_dr4:
+            hc_end_time = st.time_input(
+                "End time",
+                value=_dt_max.time(),
+                key="hc_end_time",
+                step=60,
+            )
+
+        hc_start_dt = pd.Timestamp(datetime.combine(hc_start_date, hc_start_time))
+        hc_end_dt   = pd.Timestamp(datetime.combine(hc_end_date,   hc_end_time))
+
+        _hc_apply_col, _hc_preview_col = st.columns([1, 3])
+        with _hc_apply_col:
+            _do_hc_apply = st.button("✅ Apply Height Correction", key="apply_hc", type="primary")
+        with _hc_preview_col:
+            if hc_start_dt < hc_end_dt:
+                _target_obs = (
+                    [r["name"] for r in _obs_results]
+                    if hc_file == "— All OBS files —"
+                    else [hc_file]
+                )
+                _hc_prev_mask = (
+                    (all_proc["Date"] >= hc_start_dt) &
+                    (all_proc["Date"] <= hc_end_dt) &
+                    (all_proc["Offload_file"].isin(_target_obs))
+                )
+                _hc_preview_n = int(_hc_prev_mask.sum())
+                if _hc_preview_n > 0:
+                    _sample_old = all_proc.loc[_hc_prev_mask, "Sensor_height_m"].iloc[0]
+                    _delta = hc_new_height - _sample_old
+                    st.info(
+                        f"**{_hc_preview_n}** OBS row(s) matched.  "
+                        f"Current height: **{_sample_old:.3f} m** → new: **{hc_new_height:.3f} m** "
+                        f"(Δ = {_delta:+.3f} m).  WL will shift by {_delta:+.4f} m."
+                    )
+                else:
+                    st.warning("⚠️ No OBS rows matched in that range.")
+            else:
+                st.warning("⚠️ Start must be before end.")
+
+        if _do_hc_apply:
+            if hc_start_dt >= hc_end_dt:
+                st.error("Start must be before end — no changes made.")
+            else:
+                _target_obs = (
+                    [r["name"] for r in _obs_results]
+                    if hc_file == "— All OBS files —"
+                    else [hc_file]
+                )
+                _new_results = []
+                _total_changed = 0
+                for _r in st.session_state["results"]:
+                    if _r["fmt"] == "obs_txt" and _r["name"] in _target_obs:
+                        _df = _r["processed"].copy()
+                        _m  = (_df["Date"] >= hc_start_dt) & (_df["Date"] <= hc_end_dt)
+                        if _m.any():
+                            _old_h = _df.loc[_m, "Sensor_height_m"]
+                            _delta = float(hc_new_height) - _old_h
+                            _df.loc[_m, "Water_level_m"]  = _df.loc[_m, "Water_level_m"] + _delta
+                            _df.loc[_m, "Sensor_height_m"] = float(hc_new_height)
+                            _total_changed += int(_m.sum())
+                        _r = dict(_r)
+                        _r["processed"] = _df
+                    _new_results.append(_r)
+                st.session_state["results"] = _new_results
+                st.session_state["height_correction_log"].append({
+                    "File":            hc_file,
+                    "Start":           str(hc_start_dt),
+                    "End":             str(hc_end_dt),
+                    "New height (m)":  round(float(hc_new_height), 3),
+                    "Rows corrected":  _total_changed,
+                })
+                st.rerun()
+
+        if st.session_state["height_correction_log"]:
+            st.markdown("**Correction history (this session):**")
+            st.dataframe(
+                pd.DataFrame(st.session_state["height_correction_log"]),
+                use_container_width=True, hide_index=True,
+            )
+            if st.button("🗑️ Clear history log (corrections remain)", key="clear_hc_log"):
+                st.session_state["height_correction_log"] = []
+                st.rerun()
 
 st.markdown("---")
 
