@@ -375,7 +375,7 @@ def calc_water_level_hobo(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def trim_obs_edges(
-    df: pd.DataFrame, n: int = 4
+    df: pd.DataFrame, n: int = 6
 ) -> tuple[pd.DataFrame, list[int]]:
     """
     Inspect the first and last `n` rows of an OBS DataFrame.
