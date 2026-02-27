@@ -1,0 +1,2 @@
+# Streamlit secrets (contains GCP service account credentials)
+.streamlit/secrets.toml

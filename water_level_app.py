@@ -754,10 +754,12 @@ else:  # Google Drive
             "for details."
         )
         st.stop()
+    _default_folder = st.secrets.get("drive_folder_id", "")
     _gd1, _gd2 = st.columns([3, 1])
     with _gd1:
         _folder_id = st.text_input(
             "Drive folder ID",
+            value=_default_folder,
             help="Paste the folder ID from the Google Drive URL. "
                  "Share the folder with the service account email.",
             key="gdrive_folder_id",
