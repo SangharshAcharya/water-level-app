@@ -25,6 +25,16 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Google Drive integration (optional — pip install google-api-python-client google-auth)
+_GDRIVE_AVAILABLE = False
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    _GDRIVE_AVAILABLE = True
+except ImportError:
+    pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -495,7 +505,7 @@ def download_pair(
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            f"⬇ {label} — CSV",
+            f"{label} — CSV",
             data=to_csv_bytes(df),
             file_name=f"{stem}.csv",
             mime="text/csv",
@@ -503,7 +513,7 @@ def download_pair(
         )
     with c2:
         st.download_button(
-            f"⬇ {label} — Excel",
+            f"{label} — Excel",
             data=to_excel_bytes(df),
             file_name=f"{stem}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -539,24 +549,118 @@ def wl_timeseries_fig(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Google Drive helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_drive_service():
+    """Build Google Drive API v3 service from Streamlit secrets."""
+    if not _GDRIVE_AVAILABLE:
+        return None
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds = service_account.Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]),
+                scopes=["https://www.googleapis.com/auth/drive.readonly"],
+            )
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+    return None
+
+
+def _list_drive_files(svc, folder_id: str) -> list[dict]:
+    """List .txt and .csv files in a Drive folder."""
+    q = (f"'{folder_id}' in parents and trashed=false and "
+         "(name contains '.txt' or name contains '.TXT' "
+         "or name contains '.csv' or name contains '.CSV')")
+    out, tok = [], None
+    while True:
+        r = svc.files().list(
+            q=q, fields="nextPageToken,files(id,name,size)",
+            pageSize=500, pageToken=tok,
+        ).execute()
+        out.extend(r.get("files", []))
+        tok = r.get("nextPageToken")
+        if not tok:
+            break
+    return sorted(out, key=lambda f: f["name"])
+
+
+def _list_drive_subfolders(svc, folder_id: str) -> list[dict]:
+    """List subfolders in a Drive folder."""
+    q = f"'{folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+    out, tok = [], None
+    while True:
+        r = svc.files().list(
+            q=q, fields="nextPageToken,files(id,name)",
+            pageSize=200, pageToken=tok,
+        ).execute()
+        out.extend(r.get("files", []))
+        tok = r.get("nextPageToken")
+        if not tok:
+            break
+    return sorted(out, key=lambda f: f["name"])
+
+
+def _list_drive_recursive(svc, folder_id: str, prefix: str = "") -> list[dict]:
+    """Recursively list .txt/.csv files in a Drive folder tree."""
+    results = []
+    for f in _list_drive_files(svc, folder_id):
+        f["display_path"] = f"{prefix}{f['name']}" if prefix else f["name"]
+        results.append(f)
+    for sub in _list_drive_subfolders(svc, folder_id):
+        results.extend(_list_drive_recursive(svc, sub["id"], f"{prefix}{sub['name']}/"))
+    return results
+
+
+def _download_drive_file(svc, file_id: str) -> bytes:
+    """Download file bytes from Google Drive."""
+    req = svc.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Water Level Conversion — S4W-Nepal",
+    page_title="Water Level — S4W-Nepal",
     page_icon="💧",
     layout="wide",
 )
-st.title("💧 Water Level Conversion — S4W-Nepal")
+
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.5rem; }
+    h1 { font-weight: 600; letter-spacing: -0.02em; color: #1a1a2e; }
+    h2, h3 { font-weight: 500; color: #2d3436; }
+    hr { border-color: #e8ecf1 !important; }
+    [data-testid="stMetric"] {
+        background: #ffffff; border: 1px solid #e8ecf1;
+        border-radius: 8px; padding: 10px 14px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    div[data-testid="stExpander"] details summary span {
+        font-weight: 500; color: #2d3436;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Water Level Conversion")
 st.caption(
-    "Upload **OBS** (`.txt`) and/or **Hobo** (HOBOware-exported `.csv`, or raw `.hobo`) files. "
-    "File types are detected automatically and the correct formula is applied to each."
+    "S4W-Nepal  ·  Upload **OBS** (.txt) and/or **Hobo** (.csv) files, or load "
+    "directly from Google Drive. Format is auto-detected; the correct formula is applied."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("Configuration")
     st.subheader("Atmospheric Pressure")
 
     atm_mode = st.radio(
@@ -582,7 +686,7 @@ with st.sidebar:
             baro_df = load_baro_csv(baro_file)
             if baro_df is not None:
                 st.success(
-                    f"✅ {len(baro_df):,} baro records  \n"
+                    f"{len(baro_df):,} baro records loaded  \n"
                     f"{baro_df['DateTime'].min().date()} → "
                     f"{baro_df['DateTime'].max().date()}"
                 )
@@ -605,36 +709,101 @@ Mixed uploads are fine — formats are detected automatically.
 
     st.divider()
     st.link_button(
-        "🌐 More about us",
+        "S4W-Nepal Website →",
         "https://s4w-nepal.smartphones4water.org/",
         use_container_width=True,
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File uploader
+# Data Source
 # ─────────────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "Upload raw sensor files",
-    type=["txt", "csv"],
-    accept_multiple_files=True,
-    help="Drag and drop one or more `.txt` (OpenOBS) or `.csv` (HOBOware Hobo) files. "
-         "Format is detected automatically — you can mix file types freely.",
-)
+_source_options = ["Upload files"]
+if _GDRIVE_AVAILABLE:
+    _source_options.append("Google Drive")
+if len(_source_options) > 1:
+    data_source = st.radio(
+        "Data source", _source_options, horizontal=True,
+        key="data_source_radio", label_visibility="collapsed",
+    )
+else:
+    data_source = "Upload files"
 
-if not uploaded:
-    st.info("👆 Upload one or more sensor files to begin.")
+file_cache: dict[str, bytes] = {}
+
+if data_source == "Upload files":
+    uploaded = st.file_uploader(
+        "Upload raw sensor files",
+        type=["txt", "csv"],
+        accept_multiple_files=True,
+        help="Drag and drop .txt (OpenOBS) or .csv (HOBOware Hobo) files. "
+             "Format is detected automatically.",
+    )
+    if not uploaded:
+        st.info("Upload one or more sensor files to begin.")
+        st.stop()
+    for uf in uploaded:
+        file_cache[uf.name] = uf.read()
+
+else:  # Google Drive
+    _svc = _get_drive_service()
+    if _svc is None:
+        st.error(
+            "**Google Drive not configured.** Add a `[gcp_service_account]` section "
+            "to `.streamlit/secrets.toml` with your service account JSON key fields. "
+            "See the [Streamlit docs](https://docs.streamlit.io/develop/tutorials/databases/private-gsheet) "
+            "for details."
+        )
+        st.stop()
+    _gd1, _gd2 = st.columns([3, 1])
+    with _gd1:
+        _folder_id = st.text_input(
+            "Drive folder ID",
+            help="Paste the folder ID from the Google Drive URL. "
+                 "Share the folder with the service account email.",
+            key="gdrive_folder_id",
+        )
+    with _gd2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        _refresh = st.button("Scan folder", key="gdrive_refresh")
+    if not _folder_id:
+        st.info("Enter a Google Drive folder ID to list available sensor files.")
+        st.stop()
+    _cache_key = f"gdrive_files_{_folder_id}"
+    if _refresh or _cache_key not in st.session_state:
+        with st.spinner("Scanning Drive folder…"):
+            try:
+                st.session_state[_cache_key] = _list_drive_recursive(_svc, _folder_id)
+            except Exception as e:
+                st.error(f"Failed to access folder: {e}")
+                st.stop()
+    _drive_files = st.session_state.get(_cache_key, [])
+    if not _drive_files:
+        st.warning("No .txt or .csv files found in the specified folder.")
+        st.stop()
+    _selected_names = st.multiselect(
+        f"Select files ({len(_drive_files)} found)",
+        options=[f["display_path"] for f in _drive_files],
+        default=[f["display_path"] for f in _drive_files],
+        key="gdrive_selected",
+    )
+    if not _selected_names:
+        st.info("Select at least one file to continue.")
+        st.stop()
+    _selected_set = set(_selected_names)
+    _to_download = [f for f in _drive_files if f["display_path"] in _selected_set]
+    with st.spinner(f"Downloading {len(_to_download)} file(s) from Drive…"):
+        for f in _to_download:
+            file_cache[f["display_path"]] = _download_drive_file(_svc, f["id"])
+
+if not file_cache:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto-detect formats
 # ─────────────────────────────────────────────────────────────────────────────
-file_cache:  dict[str, bytes] = {}
-file_format: dict[str, str]   = {}
-
-for uf in uploaded:
-    raw = uf.read()
-    file_cache[uf.name]  = raw
-    file_format[uf.name] = detect_format(raw, uf.name)
+file_format: dict[str, str] = {}
+for name, raw_bytes in file_cache.items():
+    file_format[name] = detect_format(raw_bytes, name)
 
 obs_names  = [n for n, fmt in file_format.items() if fmt == "obs_txt"]
 hobo_names = [n for n, fmt in file_format.items() if fmt == "hobo_csv"]
@@ -652,12 +821,12 @@ for _n in hobo_names:
 
 # Detection summary
 fmt_labels = {
-    "obs_txt":  "✅ OBS logger (.txt)",
-    "hobo_csv": "✅ Hobo HOBOware CSV",
-    "unknown":  "❌ Unknown — will be skipped",
+    "obs_txt":  "OBS logger (.txt)",
+    "hobo_csv": "Hobo U20L (.csv)",
+    "unknown":  "Unknown — skipped",
 }
 det_rows: list[dict] = []
-for _n in [u.name for u in uploaded]:
+for _n in list(file_cache.keys()):
     _row: dict = {
         "File":         _n,
         "Detected as":  fmt_labels.get(file_format[_n], file_format[_n]),
@@ -666,13 +835,13 @@ for _n in [u.name for u in uploaded]:
     }
     if file_format[_n] == "obs_txt":
         _fw, _fw_date = file_obs_firmware.get(_n, ("new", None))
-        _fw_tag = "🔴 Old (÷100)" if _fw == "old" else "🟢 New (÷10)"
+        _fw_tag = "Old (÷100)" if _fw == "old" else "New (÷10)"
         if _fw_date:
             _fw_tag += f"  FW: {_fw_date}"
         _row["OBS Firmware"] = _fw_tag
     det_rows.append(_row)
 det_df = pd.DataFrame(det_rows)
-with st.expander("� Uploaded files", expanded=False):
+with st.expander("Uploaded files — format detection", expanded=False):
     st.table(det_df)
     if any(file_obs_firmware.get(_n, ("new",))[0] == "old" for _n in obs_names):
         st.warning(
@@ -694,7 +863,7 @@ if not parseable:
     st.stop()
 
 st.markdown("---")
-st.subheader("📍 Station Name Assignment")
+st.subheader("Station Names")
 st.caption(
     "Serial numbers detected from the uploaded files are listed below. "
     "Give each one a meaningful station name — plots and downloads will be grouped by this name. "
@@ -729,7 +898,7 @@ st.session_state["sn_station_map"] = dict(zip(edited_sn["Sensor_SN"], edited_sn[
 sn_station_map = st.session_state["sn_station_map"]
 
 st.markdown("---")
-st.subheader("📏 Sensor Settings")
+st.subheader("Sensor Settings")
 st.caption(
     "Set the sensor height / calibration offset in metres. "
     "**OBS**: physical height from sensor face to channel bed. "
@@ -779,7 +948,7 @@ with bc1:
     )
 with bc2:
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("✅ Apply to OBS", key="apply_batch_heights"):
+    if st.button("Apply to OBS", key="apply_batch_heights"):
         updated = dict(st.session_state["sensor_heights"])
         for fn in parseable:
             if file_format[fn] == "obs_txt":
@@ -802,7 +971,7 @@ if hobo_files:
         )
     with hb2:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("✅ Apply to Hobo", key="apply_batch_hobo_offset"):
+        if st.button("Apply to Hobo", key="apply_batch_hobo_offset"):
             updated = dict(st.session_state["sensor_heights"])
             for fn in hobo_files:
                 updated[fn] = batch_hobo_offset
@@ -820,7 +989,7 @@ if hobo_files:
 obs_files = [fn for fn in parseable if file_format[fn] == "obs_txt"]
 obs_sns = list(dict.fromkeys(file_sn.get(fn, "—") for fn in obs_files))  # unique, ordered
 if obs_sns:
-    with st.expander("🔢 Set height by Serial Number (SN)", expanded=False):
+    with st.expander("Set height by Serial Number", expanded=False):
         st.caption(
             "Set sensor height for all files sharing the same SN at once. "
             "Each SN corresponds to one physical sensor."
@@ -839,7 +1008,7 @@ if obs_sns:
                 )
             with sc2:
                 st.markdown("<br>", unsafe_allow_html=True)
-                if st.button(f"✅ Apply to SN {sn_val}", key=f"apply_sn_{sn_val}"):
+                if st.button(f"Apply to SN {sn_val}", key=f"apply_sn_{sn_val}"):
                     updated = dict(st.session_state["sensor_heights"])
                     for fn in sn_files:
                         updated[fn] = sn_h
@@ -910,7 +1079,7 @@ if "height_range_overrides" not in st.session_state:
 _obs_files_for_rules = [fn for fn in parseable if file_format[fn] == "obs_txt"]
 if _obs_files_for_rules:
     with st.expander(
-        "📐 Date-range Height Overrides — OBS "
+        "Date-range Height Overrides — OBS "
         f"({'%d rule(s) pending' % len(st.session_state['height_range_overrides']) if st.session_state['height_range_overrides'] else 'no rules yet'})",
         expanded=bool(st.session_state["height_range_overrides"]),
     ):
@@ -947,7 +1116,7 @@ if _obs_files_for_rules:
         with _ro4:
             ro_end_time = st.time_input("End time", key="ro_end_time", step=60)
 
-        if st.button("➕ Add Rule", key="add_hr_rule"):
+        if st.button("+ Add Rule", key="add_hr_rule"):
             _ro_start = pd.Timestamp(datetime.combine(ro_start_date, ro_start_time))
             _ro_end   = pd.Timestamp(datetime.combine(ro_end_date,   ro_end_time))
             if _ro_start >= _ro_end:
@@ -972,11 +1141,11 @@ if _obs_files_for_rules:
                 } for r in st.session_state["height_range_overrides"]]),
                 use_container_width=True, hide_index=True,
             )
-            if st.button("🗑️ Clear all rules", key="clear_hr_rules"):
+            if st.button("Clear all rules", key="clear_hr_rules"):
                 st.session_state["height_range_overrides"] = []
                 st.rerun()
         else:
-            st.info("No rules yet. Set a range above and click ➕ Add Rule.")
+            st.info("No rules yet. Set a range above and click + Add Rule.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Process button
@@ -1090,7 +1259,7 @@ if st.button("▶ Process All Files", type="primary"):
 
     st.session_state["results"] = results_list
     total = sum(len(r["processed"]) for r in results_list)
-    st.success(f"✅ {total:,} records processed from {len(results_list)} file(s).")
+    st.success(f"{total:,} records processed from {len(results_list)} file(s).")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Results
@@ -1169,7 +1338,7 @@ with _sp3:
         st.caption("✅ No spikes detected at current threshold.")
 
 # ── Overview — all stations on one plot ───────────────────────────────────────
-st.markdown("### 📈 All Stations — Overview")
+st.markdown("### All Stations")
 fig_all = go.Figure()
 for i, r in enumerate(results_list):
     seg = view[view["Offload_file"] == r["name"]]
@@ -1203,7 +1372,7 @@ st.plotly_chart(fig_all, use_container_width=True)
 
 # ── Atmospheric pressure overlay ──────────────────────────────────────────────
 if baro_df is not None:
-    with st.expander("🌡️ Atmospheric Pressure (uploaded CSV)", expanded=False):
+    with st.expander("Atmospheric Pressure", expanded=False):
         bv = baro_df[
             (baro_df["DateTime"].dt.date >= start_d) &
             (baro_df["DateTime"].dt.date <= end_d)
@@ -1223,7 +1392,7 @@ st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-station results (one tab per station)
 # ─────────────────────────────────────────────────────────────────────────────
-st.subheader("📍 Per-Station Results")
+st.subheader("Per-Station Results")
 
 # Group result dicts by station name
 station_to_results: dict[str, list[dict]] = {}
@@ -1304,7 +1473,7 @@ for tab_c, station in zip(tab_containers, station_list):
 
         # Sub-panels (OBS or Hobo)
         if st_fmt == "obs_txt":
-            with st.expander(f"📊 {station} — Pressure / Backscatter / Temperature", expanded=False):
+            with st.expander(f"{station} — Pressure / Backscatter / Temperature", expanded=False):
                 fig_sub = make_subplots(
                     rows=4, cols=1, shared_xaxes=True,
                     subplot_titles=("Water Level (m)", "Raw Pressure", "Backscatter", "Water Temp (raw)"),
@@ -1330,7 +1499,7 @@ for tab_c, station in zip(tab_containers, station_list):
                 st.plotly_chart(fig_sub, use_container_width=True)
 
         elif st_fmt == "hobo_csv":
-            with st.expander(f"📊 {station} — Absolute Pressure / Temperature", expanded=False):
+            with st.expander(f"{station} — Absolute Pressure / Temperature", expanded=False):
                 fig_sub = make_subplots(
                     rows=3, cols=1, shared_xaxes=True,
                     subplot_titles=("Water Level (m)", "Absolute Pressure (kPa)", "Water Temp (°C)"),
@@ -1356,7 +1525,7 @@ for tab_c, station in zip(tab_containers, station_list):
                 st.plotly_chart(fig_sub, use_container_width=True)
 
         # Data previews
-        with st.expander(f"🗃️ {station} — Processed Data (preview)", expanded=False):
+        with st.expander(f"{station} — Processed Data (preview)", expanded=False):
             proc_cols = [
                 "Date", "Station", "Sensor_SN", "Offload_file",
                 "Sensor_height_m", "Atm_kPa", "Water_level_m",
@@ -1366,12 +1535,12 @@ for tab_c, station in zip(tab_containers, station_list):
             avail = [c for c in proc_cols if c in st_filt.columns]
             st.dataframe(st_filt[avail].head(500), use_container_width=True, height=280)
 
-        with st.expander(f"🗃️ {station} — Raw Data (preview)", expanded=False):
+        with st.expander(f"{station} — Raw Data (preview)", expanded=False):
             st.caption("Direct sensor output — no water-level conversion.")
             st.dataframe(st_raw.head(500), use_container_width=True, height=260)
 
         # Per-station downloads
-        st.markdown(f"**⬇ Downloads — {station}**")
+        st.markdown(f"**Downloads — {station}**")
         _safe = station.replace(" ", "_")
         dl1, dl2 = st.columns(2)
         with dl1:
@@ -1389,7 +1558,7 @@ for tab_c, station in zip(tab_containers, station_list):
 # ─────────────────────────────────────────────────────────────────────────────
 # Combined downloads — all stations
 # ─────────────────────────────────────────────────────────────────────────────
-st.subheader("💾 Combined Downloads — All Stations")
+st.subheader("Downloads — All Stations")
 download_pair("All Stations · Processed WL", view, f"WaterLevel_all_{date_tag}", "all_proc")
 st.markdown("---")
 if not raw_obs.empty:
@@ -1403,7 +1572,7 @@ if not raw_hobo.empty:
 # Comparison Explorer
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader("🔀 Comparison Explorer")
+st.subheader("Comparison Explorer")
 st.caption(
     "Compare water levels or other parameters across stations over the same period, "
     "or compare different time periods at the same station."
@@ -1411,14 +1580,14 @@ st.caption(
 
 comp_mode = st.radio(
     "Comparison mode",
-    ["📍 Multiple stations — same period", "📅 Same station — different periods"],
+    ["Multiple stations — same period", "Same station — different periods"],
     horizontal=True,
     label_visibility="collapsed",
     key="comp_mode_radio",
 )
 
 # ── Mode A: multiple stations, same period ────────────────────────────────────────────
-if comp_mode == "📍 Multiple stations — same period":
+if comp_mode == "Multiple stations — same period":
     cmp_c1, cmp_c2, cmp_c3 = st.columns([3, 1, 1])
     cmp_stations = cmp_c1.multiselect(
         "Stations to compare",
@@ -1577,7 +1746,7 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # About
 # ─────────────────────────────────────────────────────────────────────────────
-with st.expander("ℹ️ About — Formulas & Data Sources", expanded=False):
+with st.expander("About — Formulas & Data Sources", expanded=False):
     st.markdown(
         r"""
 ### OBS Sensor (OpenOBS `.txt`)
