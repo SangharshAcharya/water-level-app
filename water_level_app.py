@@ -224,6 +224,25 @@ def calc_water_level_obs(
     return df
 
 
+def flag_spikes(df: pd.DataFrame, threshold: float,
+                wl_col: str = "Water_level_m") -> pd.Series:
+    """
+    Returns a boolean Series (same index as df) where True = spike.
+    A spike: |WL[i] - WL[i-1]| > threshold  AND  |WL[i] - WL[i+1]| > threshold.
+    Grouped per Offload_file to avoid false positives at file boundaries.
+    First and last row of each file are never flagged.
+    """
+    spike = pd.Series(False, index=df.index)
+    grp_col = "Offload_file" if "Offload_file" in df.columns else None
+    groups = df.groupby(grp_col).groups if grp_col else {"_all": df.index}
+    for _, idx in groups.items():
+        wl     = df.loc[idx, wl_col]
+        d_prev = wl.diff().abs()      # |WL[i] - WL[i-1]|
+        d_next = wl.diff(-1).abs()    # |WL[i] - WL[i+1]|
+        spike.loc[idx] = (d_prev > threshold) & (d_next > threshold)
+    return spike
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hobo CSV parser & water-level formula
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1123,6 +1142,32 @@ m3.metric("Min WL",   f"{view['Water_level_m'].min():.3f} m")
 m4.metric("Mean WL",  f"{view['Water_level_m'].mean():.3f} m")
 m5.metric("Stations", str(len(stations_all)))
 
+# ── Spike outlier detection ──────────────────────────────────────────────────
+_sp1, _sp2, _sp3 = st.columns([3, 1, 2])
+with _sp1:
+    spike_threshold = st.slider(
+        "Spike detection threshold (m)",
+        min_value=0.05, max_value=2.0, value=0.30, step=0.05, format="%.2f",
+        key="spike_threshold",
+        help=(
+            "A reading is flagged as a spike if it deviates more than this amount "
+            "from **both** the previous and the next reading — i.e. it jumps away and "
+            "immediately returns. Flagged points are shown as ● grey markers in the plots."
+        ),
+    )
+view["_spike"] = flag_spikes(view, spike_threshold)
+_n_spikes = int(view["_spike"].sum())
+with _sp2:
+    st.metric("Spikes flagged", _n_spikes)
+with _sp3:
+    if _n_spikes:
+        st.caption(
+            f"⚠️ {_n_spikes} spike(s) shown as grey ● in plots below. "
+            "Lower the threshold to flag more; raise it to flag fewer."
+        )
+    else:
+        st.caption("✅ No spikes detected at current threshold.")
+
 # ── Overview — all stations on one plot ───────────────────────────────────────
 st.markdown("### 📈 All Stations — Overview")
 fig_all = go.Figure()
@@ -1138,6 +1183,17 @@ for i, r in enumerate(results_list):
         line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
         hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<extra></extra>",
     ))
+    _spk = seg[seg["_spike"]]
+    if not _spk.empty:
+        fig_all.add_trace(go.Scatter(
+            x=_spk["Date"], y=_spk["Water_level_m"],
+            mode="markers",
+            name="Spike",
+            marker=dict(color="grey", size=8, symbol="circle",
+                        opacity=0.75, line=dict(color="black", width=1)),
+            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<br>⚠️ Spike<extra></extra>",
+            showlegend=(i == 0),  # only one legend entry
+        ))
 fig_all.update_layout(
     xaxis_title="Date / Time", yaxis_title="Water Level (m)",
     height=420, hovermode="x unified", template="plotly_white",
@@ -1210,6 +1266,10 @@ for tab_c, station in zip(tab_containers, station_list):
         sm4.metric("Mean WL", f"{st_filt['Water_level_m'].mean():.3f} m")
 
         # Water level timeseries — all offloads on one plot, colored per offload file
+        st_filt["_spike"] = flag_spikes(st_filt, spike_threshold)
+        _st_spikes = int(st_filt["_spike"].sum())
+        if _st_spikes:
+            st.caption(f"⚠️ {_st_spikes} spike(s) flagged at threshold {spike_threshold:.2f} m — shown as grey ● below.")
         fig_wl = go.Figure()
         for i, fn in enumerate(st_files):
             seg = st_filt[st_filt["Offload_file"] == fn]
@@ -1223,6 +1283,17 @@ for tab_c, station in zip(tab_containers, station_list):
                 line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
                 hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<extra></extra>",
             ))
+            _spk = seg[seg["_spike"]]
+            if not _spk.empty:
+                fig_wl.add_trace(go.Scatter(
+                    x=_spk["Date"], y=_spk["Water_level_m"],
+                    mode="markers",
+                    name="Spike",
+                    marker=dict(color="grey", size=9, symbol="circle",
+                                opacity=0.75, line=dict(color="black", width=1)),
+                    hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>WL: %{y:.4f} m<br>⚠️ Spike<extra></extra>",
+                    showlegend=(i == 0),
+                ))
         fig_wl.update_layout(
             title=f"Water Level — {station}",
             xaxis_title="Date / Time", yaxis_title="Water Level (m)",
