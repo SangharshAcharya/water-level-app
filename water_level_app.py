@@ -739,9 +739,10 @@ default_fw_list: list[str] = [
 # ── Session-state backed heights (reset whenever file list changes) ────────────
 _file_key = tuple(sorted(parseable))
 if st.session_state.get("_sensor_files_key") != _file_key:
-    st.session_state["_sensor_files_key"]  = _file_key
-    st.session_state["sensor_heights"]     = dict(zip(parseable, default_h_list))
-    st.session_state["obs_fw_overrides"]   = dict(zip(parseable, default_fw_list))
+    st.session_state["_sensor_files_key"]    = _file_key
+    st.session_state["sensor_heights"]       = dict(zip(parseable, default_h_list))
+    st.session_state["obs_fw_overrides"]     = dict(zip(parseable, default_fw_list))
+    st.session_state["height_range_overrides"] = []
     st.session_state.pop("results", None)   # reset results when files change
 
 current_heights  = st.session_state["sensor_heights"]
@@ -882,6 +883,83 @@ file_heights      = st.session_state["sensor_heights"]
 file_fw_overrides = st.session_state["obs_fw_overrides"]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Date-range height overrides (OBS only) — applied during processing
+# ─────────────────────────────────────────────────────────────────────────────
+if "height_range_overrides" not in st.session_state:
+    st.session_state["height_range_overrides"] = []
+
+_obs_files_for_rules = [fn for fn in parseable if file_format[fn] == "obs_txt"]
+if _obs_files_for_rules:
+    with st.expander(
+        "📐 Date-range Height Overrides — OBS "
+        f"({'%d rule(s) pending' % len(st.session_state['height_range_overrides']) if st.session_state['height_range_overrides'] else 'no rules yet'})",
+        expanded=bool(st.session_state["height_range_overrides"]),
+    ):
+        st.caption(
+            "Define a different **sensor height** for a specific date/time range within one or more OBS files. "
+            "Useful when the sensor was repositioned mid-deployment. "
+            "Rules are applied **when you click ▶ Process All Files**. "
+            "Add multiple rules as needed — each covers a separate period."
+        )
+
+        _ro_file_opts = ["— All OBS files —"] + _obs_files_for_rules
+        _rc1, _rc2 = st.columns([2, 2])
+        with _rc1:
+            ro_file = st.selectbox(
+                "File", options=_ro_file_opts, key="ro_file_select",
+                help="Target one specific OBS file, or all OBS files at once.",
+            )
+        with _rc2:
+            ro_height = st.number_input(
+                "Sensor height for this range (m)",
+                min_value=0.0, max_value=5.0,
+                value=0.10, step=0.005, format="%.3f",
+                key="ro_height_input",
+                help="The correct sensor height to use for all timestamps in this range.",
+            )
+
+        _ro1, _ro2, _ro3, _ro4 = st.columns(4)
+        with _ro1:
+            ro_start_date = st.date_input("Start date", key="ro_start_date")
+        with _ro2:
+            ro_start_time = st.time_input("Start time", key="ro_start_time", step=60)
+        with _ro3:
+            ro_end_date = st.date_input("End date", key="ro_end_date")
+        with _ro4:
+            ro_end_time = st.time_input("End time", key="ro_end_time", step=60)
+
+        if st.button("➕ Add Rule", key="add_hr_rule"):
+            _ro_start = pd.Timestamp(datetime.combine(ro_start_date, ro_start_time))
+            _ro_end   = pd.Timestamp(datetime.combine(ro_end_date,   ro_end_time))
+            if _ro_start >= _ro_end:
+                st.error("Start must be before end — rule not added.")
+            else:
+                st.session_state["height_range_overrides"].append({
+                    "file":     ro_file,
+                    "start_dt": _ro_start,
+                    "end_dt":   _ro_end,
+                    "height":   float(ro_height),
+                })
+                st.rerun()
+
+        if st.session_state["height_range_overrides"]:
+            st.markdown("**Pending rules — will be applied on next ▶ Process:**")
+            st.dataframe(
+                pd.DataFrame([{
+                    "File":       r["file"],
+                    "Start":      str(r["start_dt"]),
+                    "End":        str(r["end_dt"]),
+                    "Height (m)": r["height"],
+                } for r in st.session_state["height_range_overrides"]]),
+                use_container_width=True, hide_index=True,
+            )
+            if st.button("🗑️ Clear all rules", key="clear_hr_rules"):
+                st.session_state["height_range_overrides"] = []
+                st.rerun()
+        else:
+            st.info("No rules yet. Set a range above and click ➕ Add Rule.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Process button
 # ─────────────────────────────────────────────────────────────────────────────
 if st.button("▶ Process All Files", type="primary"):
@@ -912,6 +990,18 @@ if st.button("▶ Process All Files", type="primary"):
             if fw_val not in ("old", "new"):
                 fw_val = file_obs_firmware.get(fname, ("new",))[0]
             processed = calc_water_level_obs(raw, sh, baro_df, default_atm_kpa, firmware=fw_val)
+            # Apply any date-range height override rules for this OBS file
+            for _rule in st.session_state.get("height_range_overrides", []):
+                if _rule["file"] in ("— All OBS files —", fname):
+                    _rm = (
+                        (processed["Date"] >= _rule["start_dt"]) &
+                        (processed["Date"] <= _rule["end_dt"])
+                    )
+                    if _rm.any():
+                        _old_h = processed.loc[_rm, "Sensor_height_m"]
+                        _delta = float(_rule["height"]) - _old_h
+                        processed.loc[_rm, "Water_level_m"]   = processed.loc[_rm, "Water_level_m"] + _delta
+                        processed.loc[_rm, "Sensor_height_m"] = float(_rule["height"])
         else:
             raw, err = parse_hobo_csv(fb, fname)
             if err:
@@ -1071,159 +1161,6 @@ if baro_df is not None:
             height=240, template="plotly_white", margin=dict(t=20, b=30),
         )
         st.plotly_chart(fig_b, use_container_width=True)
-
-st.markdown("---")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Date-range Sensor Height Correction (OBS only)
-# ─────────────────────────────────────────────────────────────────────────────
-# Water level for OBS is: WL = hydro_pressure_term + sensor_height
-# Stored as:               WL = (WL - Sensor_height_m) + Sensor_height_m
-# Changing height for a range: new_WL = old_WL - old_Sensor_height_m + new_height
-# ─────────────────────────────────────────────────────────────────────────────
-if "height_correction_log" not in st.session_state:
-    st.session_state["height_correction_log"] = []
-
-_obs_results = [r for r in results_list if r["fmt"] == "obs_txt"]
-
-if _obs_results:
-    with st.expander("📐 Date-range Sensor Height Correction — OBS files", expanded=False):
-        st.caption(
-            "Apply a different **sensor height offset** to OBS records within a specific date/time range. "
-            "Use this when the sensor was repositioned or its installation height changed partway through "
-            "a deployment. The water level is **recalculated** from the stored pressure data: "
-            "`new_WL = old_WL − old_height + new_height`. "
-            "Set the range, pick an OBS file (or all OBS files), enter the correct height, and click **Apply**. "
-            "Repeat for as many date ranges as needed. "
-            "**Re-processing the files will reset all corrections.**"
-        )
-
-        _hc_c1, _hc_c2 = st.columns([2, 2])
-        with _hc_c1:
-            _obs_file_opts = ["— All OBS files —"] + [r["name"] for r in _obs_results]
-            hc_file = st.selectbox(
-                "Apply to OBS file",
-                options=_obs_file_opts,
-                key="hc_file_select",
-                help="Target a specific OBS offload file, or apply to all OBS files at once.",
-            )
-        with _hc_c2:
-            hc_new_height = st.number_input(
-                "New sensor height (m)",
-                min_value=0.0, max_value=5.0,
-                value=0.10, step=0.005, format="%.3f",
-                key="hc_new_height_input",
-                help="Physical height of the sensor face above the channel bed for this period.",
-            )
-
-        _dt_min = all_proc["Date"].min()
-        _dt_max = all_proc["Date"].max()
-
-        _hc_dr1, _hc_dr2, _hc_dr3, _hc_dr4 = st.columns(4)
-        with _hc_dr1:
-            hc_start_date = st.date_input(
-                "Start date",
-                value=_dt_min.date(),
-                min_value=_dt_min.date(), max_value=_dt_max.date(),
-                key="hc_start_date",
-            )
-        with _hc_dr2:
-            hc_start_time = st.time_input(
-                "Start time",
-                value=_dt_min.time(),
-                key="hc_start_time",
-                step=60,
-            )
-        with _hc_dr3:
-            hc_end_date = st.date_input(
-                "End date",
-                value=_dt_max.date(),
-                min_value=_dt_min.date(), max_value=_dt_max.date(),
-                key="hc_end_date",
-            )
-        with _hc_dr4:
-            hc_end_time = st.time_input(
-                "End time",
-                value=_dt_max.time(),
-                key="hc_end_time",
-                step=60,
-            )
-
-        hc_start_dt = pd.Timestamp(datetime.combine(hc_start_date, hc_start_time))
-        hc_end_dt   = pd.Timestamp(datetime.combine(hc_end_date,   hc_end_time))
-
-        _hc_apply_col, _hc_preview_col = st.columns([1, 3])
-        with _hc_apply_col:
-            _do_hc_apply = st.button("✅ Apply Height Correction", key="apply_hc", type="primary")
-        with _hc_preview_col:
-            if hc_start_dt < hc_end_dt:
-                _target_obs = (
-                    [r["name"] for r in _obs_results]
-                    if hc_file == "— All OBS files —"
-                    else [hc_file]
-                )
-                _hc_prev_mask = (
-                    (all_proc["Date"] >= hc_start_dt) &
-                    (all_proc["Date"] <= hc_end_dt) &
-                    (all_proc["Offload_file"].isin(_target_obs))
-                )
-                _hc_preview_n = int(_hc_prev_mask.sum())
-                if _hc_preview_n > 0:
-                    _sample_old = all_proc.loc[_hc_prev_mask, "Sensor_height_m"].iloc[0]
-                    _delta = hc_new_height - _sample_old
-                    st.info(
-                        f"**{_hc_preview_n}** OBS row(s) matched.  "
-                        f"Current height: **{_sample_old:.3f} m** → new: **{hc_new_height:.3f} m** "
-                        f"(Δ = {_delta:+.3f} m).  WL will shift by {_delta:+.4f} m."
-                    )
-                else:
-                    st.warning("⚠️ No OBS rows matched in that range.")
-            else:
-                st.warning("⚠️ Start must be before end.")
-
-        if _do_hc_apply:
-            if hc_start_dt >= hc_end_dt:
-                st.error("Start must be before end — no changes made.")
-            else:
-                _target_obs = (
-                    [r["name"] for r in _obs_results]
-                    if hc_file == "— All OBS files —"
-                    else [hc_file]
-                )
-                _new_results = []
-                _total_changed = 0
-                for _r in st.session_state["results"]:
-                    if _r["fmt"] == "obs_txt" and _r["name"] in _target_obs:
-                        _df = _r["processed"].copy()
-                        _m  = (_df["Date"] >= hc_start_dt) & (_df["Date"] <= hc_end_dt)
-                        if _m.any():
-                            _old_h = _df.loc[_m, "Sensor_height_m"]
-                            _delta = float(hc_new_height) - _old_h
-                            _df.loc[_m, "Water_level_m"]  = _df.loc[_m, "Water_level_m"] + _delta
-                            _df.loc[_m, "Sensor_height_m"] = float(hc_new_height)
-                            _total_changed += int(_m.sum())
-                        _r = dict(_r)
-                        _r["processed"] = _df
-                    _new_results.append(_r)
-                st.session_state["results"] = _new_results
-                st.session_state["height_correction_log"].append({
-                    "File":            hc_file,
-                    "Start":           str(hc_start_dt),
-                    "End":             str(hc_end_dt),
-                    "New height (m)":  round(float(hc_new_height), 3),
-                    "Rows corrected":  _total_changed,
-                })
-                st.rerun()
-
-        if st.session_state["height_correction_log"]:
-            st.markdown("**Correction history (this session):**")
-            st.dataframe(
-                pd.DataFrame(st.session_state["height_correction_log"]),
-                use_container_width=True, hide_index=True,
-            )
-            if st.button("🗑️ Clear history log (corrections remain)", key="clear_hc_log"):
-                st.session_state["height_correction_log"] = []
-                st.rerun()
 
 st.markdown("---")
 
