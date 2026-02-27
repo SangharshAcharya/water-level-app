@@ -1,0 +1,64 @@
+flowchart TD
+    A([🚀 App Start]) --> B
+
+    subgraph SIDEBAR["⚙️ Configuration"]
+        B[Atmospheric pressure\nDefault 86 kPa or Upload CSV]
+    end
+
+    B --> F[📂 Upload sensor files\n.txt OBS · .csv Hobo]
+    F --> G{Files uploaded?}
+    G -- No --> H([Stop])
+    G -- Yes --> I
+
+    subgraph DETECT["🔍 Format Detection"]
+        I{File type?}
+        I -- OBS .txt --> L[Detect firmware\npressure > 50 000 → old ÷100\nelse new ÷10]
+        I -- Hobo .csv --> M[Auto-detect pressure unit\nkPa / mbar / psi / Pa]
+        I -- Unknown --> N[⚠️ Skip]
+    end
+
+    subgraph SETTINGS["📏 Sensor Settings"]
+        O[Map SN → Station name] --> P[Set sensor height / offset\nper file or batch]
+    end
+
+    L --> O
+    M --> O
+
+    P --> U
+
+    subgraph PROCESS["▶ Processing"]
+        U[Process All Files] --> W{Format?}
+        W -- OBS --> X[Parse → Trim edge outliers\n→ calc_water_level_obs\nhydroP_mbar + h_sensor]
+        W -- Hobo --> Y[Parse → Unit conversion\n→ calc_water_level_hobo\nHydro_kPa ÷ 9.80665 + h_sensor]
+        X --> Z[Merge baro · attach Station & SN]
+        Y --> Z
+    end
+
+    Z --> BB
+
+    subgraph RESULTS["📊 Results"]
+        BB[Date-range filter\nOverview metrics & chart] --> BH[Per-station tabs\nWL chart · sub-panels · data preview]
+        BH --> BO[Downloads per station\nCSV & Excel]
+    end
+
+    BO --> CP
+
+    subgraph COMBINED["💾 Downloads & Comparison"]
+        CP[Combined downloads\nAll stations] --> CQ[🔀 Comparison Explorer]
+        CQ -- Multi-station --> CS[Overlay chart by station]
+        CQ -- Multi-period --> CT[Overlay chart by period]
+    end
+
+    CS --> CU([ℹ️ About & Formulas])
+    CT --> CU
+
+    style A fill:#1a73e8,color:#fff
+    style H fill:#f44336,color:#fff
+    style N fill:#f44336,color:#fff
+    style CU fill:#34a853,color:#fff
+    style SIDEBAR fill:#e8f4fd,stroke:#1a73e8
+    style DETECT fill:#fff8e1,stroke:#f9a825
+    style SETTINGS fill:#fce4ec,stroke:#e91e63
+    style PROCESS fill:#e8f5e9,stroke:#388e3c
+    style RESULTS fill:#f3e5f5,stroke:#7b1fa2
+    style COMBINED fill:#e0f2f1,stroke:#00897b

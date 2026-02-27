@@ -1,0 +1,6 @@
+If found, please contact tlang@live.unc.edu
+Firmware updated: 2025/08/01
+OpenOBS SN:467
+
+time,ambient_light,backscatter,pressure,water_temp,battery
+1757396246,15,6518,87192,1943,123

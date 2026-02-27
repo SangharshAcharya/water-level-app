@@ -1,0 +1,6 @@
+Firmware updated: 2025/04/20
+OpenOBS SN:455
+
+time,millis,ambient_light,backscatter,pressure,water_temp,battery
+1751222905,202,11132,13784,217120,2450,154
+1751222927,184,31351,13749,217140,2452,156
